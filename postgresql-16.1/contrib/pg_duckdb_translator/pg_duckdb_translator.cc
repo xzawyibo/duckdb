@@ -198,7 +198,7 @@ struct PgColBinding {
 
 
 
-// 你自定义的 info，假设长这样：
+// 自定义的 info，假设长这样：
 struct PgTableFunctionInfo : public duckdb::TableFunctionInfo {
     explicit PgTableFunctionInfo(std::string table_name_p) : table_name(std::move(table_name_p)) {}
     std::string table_name;
