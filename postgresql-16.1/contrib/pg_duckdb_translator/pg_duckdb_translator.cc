@@ -1206,7 +1206,7 @@ PgPhysicalPlanGenerator::PlanFromPlannedStmt(PlannedStmt *stmt) {
     duckdb::PhysicalOperator &root = CreatePlan(stmt->planTree);
     physical_plan->SetRoot(root);
 
-    // // 可选：如果你链接的 DuckDB 版本有 Verify，就调一下
+    // // 可选：如果链接的 DuckDB 版本有 Verify，就调一下
     // physical_plan->Verify();
 
     return std::move(physical_plan);
