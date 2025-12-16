@@ -3747,6 +3747,14 @@ create_grouping_paths(PlannerInfo *root,
 		if (can_partial_agg(root))
 			flags |= GROUPING_CAN_PARTIAL_AGG;
 
+		if (enable_hashagg &&
+            (flags & GROUPING_CAN_USE_HASH) &&
+            !(gd && gd->rollups != NIL) &&
+            !parse->groupingSets)
+        {
+            flags &= ~GROUPING_CAN_USE_SORT;
+        }
+
 		extra.flags = flags;
 		extra.target_parallel_safe = target_parallel_safe;
 		extra.havingQual = parse->havingQual;
