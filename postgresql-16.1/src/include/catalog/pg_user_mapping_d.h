@@ -1,1 +1,0 @@
-/home/shf/pg/postgresql-16.1/src/backend/catalog/pg_user_mapping_d.h

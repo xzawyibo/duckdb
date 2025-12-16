@@ -1,1 +1,0 @@
-/home/shf/pg/postgresql-16.1/src/backend/catalog/pg_foreign_data_wrapper_d.h

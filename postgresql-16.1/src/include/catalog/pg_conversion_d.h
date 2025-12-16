@@ -1,1 +1,0 @@
-/home/shf/pg/postgresql-16.1/src/backend/catalog/pg_conversion_d.h
