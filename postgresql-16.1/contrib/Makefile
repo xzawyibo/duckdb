@@ -49,6 +49,7 @@ SUBDIRS = \
 		tcn		\
 		test_decoding	\
 		tsm_system_rows \
+		pg_duckdb_translator \
 		tsm_system_time \
 		unaccent	\
 		vacuumlo

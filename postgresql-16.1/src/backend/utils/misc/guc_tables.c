@@ -881,6 +881,16 @@ struct config_bool ConfigureNamesBool[] =
 		NULL, NULL, NULL
 	},
 	{
+		{"enable_tpch", PGC_USERSET, QUERY_TUNING_METHOD,
+			gettext_noop("use tpch optimizer."),
+			NULL,
+			GUC_EXPLAIN
+		},
+		&enable_tpch,
+		false,
+		NULL, NULL, NULL
+	},
+	{
 		{"enable_material", PGC_USERSET, QUERY_TUNING_METHOD,
 			gettext_noop("Enables the planner's use of materialization."),
 			NULL,

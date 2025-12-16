@@ -43,6 +43,9 @@
 #include "utils/lsyscache.h"
 
 
+/* guc */
+bool enable_tpch = false;
+
 /*
  * Flag bits that can appear in the flags argument of create_plan_recurse().
  * These can be OR-ed together.
@@ -389,6 +392,9 @@ create_plan_recurse(PlannerInfo *root, Path *best_path, int flags)
 
 	/* Guard against stack overflow due to overly complex plans */
 	check_stack_depth();
+
+	if (enable_tpch)
+		flags |= CP_SMALL_TLIST;
 
 	switch (best_path->pathtype)
 	{
