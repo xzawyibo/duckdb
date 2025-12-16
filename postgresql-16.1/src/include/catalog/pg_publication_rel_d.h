@@ -1,0 +1,1 @@
+/home/shf/pg/postgresql-16.1/src/backend/catalog/pg_publication_rel_d.h

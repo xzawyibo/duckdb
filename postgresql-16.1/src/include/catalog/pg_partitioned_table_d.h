@@ -1,0 +1,1 @@
+/home/shf/pg/postgresql-16.1/src/backend/catalog/pg_partitioned_table_d.h
