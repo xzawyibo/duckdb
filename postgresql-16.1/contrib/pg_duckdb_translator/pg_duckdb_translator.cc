@@ -166,6 +166,7 @@ using duckdb::LogicalType;
 using duckdb::unique_ptr;
 using duckdb::make_uniq;
 using duckdb::PhysicalOperator;
+using duckdb::ExpressionIterator;
 
 static void set_error(char **error_msg, const char *msg) {
     if (!error_msg) return;
@@ -1169,6 +1170,7 @@ public:
     duckdb::PhysicalOperator &CreatePlanResult(Result *res);
     duckdb::PhysicalOperator &ExtractAggregateExpressionsCompat(duckdb::PhysicalOperator &child, duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> &aggregates,
 	    duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> &groups);
+    PhysicalOperator &duplicate_subexprs(PhysicalOperator &child, vector<unique_ptr<Expression>> &aggregates, vector<unique_ptr<Expression>> &groups);
 
     // DuckDB 的 Make<T> 包一层，方便使用（跟 PhysicalPlanGenerator 一样的写法）
     // template <class T, class... ARGS>
@@ -1193,6 +1195,25 @@ private:
     List *range_table = nullptr;
 };
 
+struct CSENode {
+	idx_t count;
+	optional_idx column_index;
+
+	CSENode() : count(1), column_index() {
+	}
+};
+
+struct CSEReplaceState {
+    bool perform_replacement;
+	//! Map of expression -> CSENode
+	expression_map_t<CSENode> expression_count;
+	//! Map of column bindings to column indexes in the projection expression list
+	column_binding_map_t<idx_t> column_map;
+	//! The set of expressions of the resulting projection
+	vector<unique_ptr<Expression>> expressions;
+	//! Cached expressions that are kept around so the expression_map always contains valid expressions
+	vector<unique_ptr<Expression>> cached_expressions;
+};
 
 unique_ptr<duckdb::PhysicalPlan>
 PgPhysicalPlanGenerator::PlanFromPlannedStmt(PlannedStmt *stmt) {
@@ -1607,6 +1628,125 @@ PgPhysicalPlanGenerator::CreatePlanResult(Result *res) {
 }
 
 
+// 收集是否有重复表达式
+static void
+CountExpressions(Expression &expr, CSEReplaceState &state) {
+	// we only consider expressions with children for CSE elimination
+	switch (expr.GetExpressionClass()) {
+	case ExpressionClass::BOUND_COLUMN_REF:
+	case ExpressionClass::BOUND_CONSTANT:
+	case ExpressionClass::BOUND_PARAMETER:
+		return;
+	default:
+		break;
+	}
+	if (expr.GetExpressionClass() != ExpressionClass::BOUND_AGGREGATE && !expr.IsVolatile()) {
+		// we can't move aggregates to a projection, so we only consider the children of the aggregate
+		auto node = state.expression_count.find(expr);
+		if (node == state.expression_count.end())
+			// first time we encounter this expression, insert this node with [count = 1]
+			// but only if it is not an interior argument of a short circuit sensitive expression.
+				state.expression_count[expr] = CSENode();
+		else {
+			// we encountered this expression before, increment the occurrence count
+			node->second.count++;
+            state.perform_replacement = true;
+		}
+	}
+
+	// recursively count the children
+	ExpressionIterator::EnumerateChildren(expr, [&](Expression &child) { CountExpressions(child, state); });
+}
+
+static void
+PerformCSEReplacement(unique_ptr<Expression> &expr_ptr, CSEReplaceState &state) {
+	Expression &expr = *expr_ptr;
+	// 对不同类型的表达式做替换处理，目标是将重复表达式替换为投影中计算的列引用
+	if (expr.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
+		auto &bound_column_ref = expr.Cast<BoundColumnRefExpression>();
+		// bound column ref, check if this one has already been recorded in the expression list
+		auto column_entry = state.column_map.find(bound_column_ref.binding);
+		if (column_entry == state.column_map.end()) {
+			// not there yet: push the expression
+			idx_t new_column_index = state.expressions.size();
+			state.column_map[bound_column_ref.binding] = new_column_index;
+			state.expressions.push_back(make_uniq<BoundColumnRefExpression>(
+			    bound_column_ref.GetAlias(), bound_column_ref.return_type, bound_column_ref.binding));
+			bound_column_ref.binding = ColumnBinding(0, new_column_index);
+		} else {
+			// else: just update the column binding!
+			bound_column_ref.binding = ColumnBinding(0, column_entry->second);
+		}
+		return;
+	}
+
+	// check if this child is eligible for CSE elimination
+	if (state.expression_count.find(expr) != state.expression_count.end()) {
+		auto &node = state.expression_count[expr];
+		if (node.count > 1) {
+			// this expression occurs more than once! push it into the projection
+			// check if it has already been pushed into the projection
+			auto alias = expr.GetAlias();
+			auto type = expr.return_type;
+			if (!node.column_index.IsValid()) {
+				// has not been pushed yet: push it
+				node.column_index = state.expressions.size();
+				state.expressions.push_back(std::move(expr_ptr));
+			} else {
+				state.cached_expressions.push_back(std::move(expr_ptr));
+			}
+			// replace the original expression with a bound column ref
+			expr_ptr = make_uniq<BoundReferenceExpression>(type, node.column_index.GetIndex());
+			return;
+		}
+	}
+	// this expression only occurs once, we can't perform CSE elimination
+	// look into the children to see if we can replace them
+	ExpressionIterator::EnumerateChildren(expr,
+	                                      [&](unique_ptr<Expression> &child) { PerformCSEReplacement(child, state); });
+}
+
+PhysicalOperator &
+PgPhysicalPlanGenerator::duplicate_subexprs(PhysicalOperator &child,
+            vector<unique_ptr<Expression>> &aggregates,
+            vector<unique_ptr<Expression>> &groups) {
+    vector<LogicalType> proj_types;
+    vector<unique_ptr<Expression>> proj_exprs;
+    CSEReplaceState state;
+    state.perform_replacement = false;
+
+    //  遍历收集
+    for (auto &expr : groups)
+        CountExpressions(*expr, state);
+    for (auto &expr : aggregates)
+        CountExpressions(*expr, state);
+
+    // 无重复内容
+    if (!state.perform_replacement)
+        return child;
+
+    // 遍历 map，找出重复的表达式
+    for (auto &expr : groups)
+        PerformCSEReplacement(expr, state);
+    for (auto &expr : aggregates)
+        PerformCSEReplacement(expr, state);
+
+    // 构造 proj_types
+    for (auto &expr : state.expressions)
+        proj_types.push_back(expr->return_type);
+
+    // 构造Projection
+    auto &projection = Make<PhysicalProjection>(
+        std::move(proj_types),
+        std::move(state.expressions),
+        child.estimated_cardinality
+    );
+
+    projection.children.push_back(child);
+    return projection;
+}
+
+
 duckdb::PhysicalOperator &
 PgPhysicalPlanGenerator::ExtractAggregateExpressionsCompat(
     duckdb::PhysicalOperator &child,
@@ -1912,6 +2052,8 @@ PgPhysicalPlanGenerator::CreatePlanAgg(Agg *agg) {
 
     // 压缩后 key 的类型（例如 UTINYINT）
     duckdb::LogicalType compress_key_type = duckdb::LogicalType::UTINYINT;
+    // 为聚集函数做重复表达式消除的问题
+    auto &duplicate_child = duplicate_subexprs(child_phys, aggregates, groups);
 
     // 如果后面要解压，需要提前知道 compress 的返回类型
     if (has_string_group) {
@@ -1935,7 +2077,7 @@ PgPhysicalPlanGenerator::CreatePlanAgg(Agg *agg) {
     }
 
 
-    duckdb::PhysicalOperator *agg_child = &child_phys;
+    duckdb::PhysicalOperator *agg_child = &duplicate_child;
 
     // --------------------------------------------------
     // 5) 在 proj_child 上面插一层真正的“压缩 PROJECTION”
