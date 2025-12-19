@@ -130,6 +130,11 @@
 #include "duckdb/common/insertion_order_preserving_map.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/catalog/catalog_entry/scalar_function_catalog_entry.hpp"
+#include "duckdb/planner/expression.hpp"
+#include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "duckdb/planner/expression/bound_function_expression.hpp"
+#include "duckdb/common/to_string.hpp"
+#include "duckdb/common/string_util.hpp"
 
 
 extern "C" {
@@ -198,7 +203,7 @@ struct PgColBinding {
 
 
 
-// 自定义的 info，假设长这样：
+// 你自定义的 info，假设长这样：
 struct PgTableFunctionInfo : public duckdb::TableFunctionInfo {
     explicit PgTableFunctionInfo(std::string table_name_p) : table_name(std::move(table_name_p)) {}
     std::string table_name;
@@ -1206,7 +1211,7 @@ PgPhysicalPlanGenerator::PlanFromPlannedStmt(PlannedStmt *stmt) {
     duckdb::PhysicalOperator &root = CreatePlan(stmt->planTree);
     physical_plan->SetRoot(root);
 
-    // // 可选：如果链接的 DuckDB 版本有 Verify，就调一下
+    // // 可选：如果你链接的 DuckDB 版本有 Verify，就调一下
     // physical_plan->Verify();
 
     return std::move(physical_plan);
@@ -2017,7 +2022,7 @@ PgPhysicalPlanGenerator::CreatePlanAgg(Agg *agg) {
             if (!group_is_string[gi]) {
                 continue;
             }
-            auto *ref = dynamic_cast<duckdb::BoundReferenceExpression *>(groups[gi].get());
+            auto *ref = dynamic_cast<duckdb::BoundColumnRefExpression  *>(groups[gi].get());
             if (ref) {
                 ref->return_type = compress_key_type;
             }
@@ -2177,8 +2182,8 @@ PgPhysicalPlanGenerator::CreatePlanSort(Sort *sort) {
     // 1. 递归构造 child 的物理计划
     auto &child_phys = CreatePlan(child_plan);
 
+    // 没有排序列，直接返回
     if (sort->numCols == 0) {
-        // 没有排序键，直接返回 child
         return child_phys;
     }
 
@@ -2197,18 +2202,37 @@ PgPhysicalPlanGenerator::CreatePlanSort(Sort *sort) {
         output_types.push_back(PgTypeOidToDuckType(typid, typmod));
     }
 
-    // 3. 判断哪些排序键是“字符串类型”（压缩候选）
+    // ---------- 3) 收集 ORDER BY 键的元信息 ----------
     auto IsStringTypePG = [](Oid typid) {
         return (typid == BPCHAROID  ||
                 typid == VARCHAROID ||
                 typid == TEXTOID   ||
                 typid == NAMEOID);
     };
-    duckdb::vector<bool> key_is_string;
+
+    // 每个排序键：是否字符串类型
+    duckdb::vector<bool>           key_is_string;
+    // 每个排序键：在 child 输出里的列下标（0-based）
+    duckdb::vector<idx_t>          sort_col_indices;
+    // 每个排序键：排序方向 / NULL 顺序
+    duckdb::vector<OrderType>      key_order_type;
+    duckdb::vector<OrderByNullType> key_null_order;
+    // 每个排序键：人类可读列名，用作 alias（比如 "l_orderkey"）
+    duckdb::vector<std::string>    key_names;
+
     key_is_string.reserve(sort->numCols);
+    sort_col_indices.reserve(sort->numCols);
+    key_order_type.reserve(sort->numCols);
+    key_null_order.reserve(sort->numCols);
+    key_names.reserve(sort->numCols);
 
     for (int i = 0; i < sort->numCols; i++) {
-        AttrNumber resno = sort->sortColIdx[i];
+        AttrNumber resno = sort->sortColIdx[i];   // ORDER BY 对应 targetlist 的第几列（1-based）
+        // SeqScan / Projection 这套转换里，我们约定：列序号 = resno - 1
+        idx_t col_idx = (idx_t)(resno - 1);
+        sort_col_indices.push_back(col_idx);
+
+        // 找到对应的 TargetEntry，便于拿类型和名字
         TargetEntry *tle = nullptr;
         for (ListCell *lc = list_head(plan_node->targetlist);
              lc != nullptr;
@@ -2224,41 +2248,19 @@ PgPhysicalPlanGenerator::CreatePlanSort(Sort *sort) {
                     (errmsg("CreatePlanSort: cannot find TargetEntry for sortColIdx %d",
                             (int)resno)));
         }
+
+        // 类型：判断是不是字符串
         Oid typid = exprType((Node *)tle->expr);
         key_is_string.push_back(IsStringTypePG(typid));
-    }
 
-    // 4. 构造排序键（BoundOrderByNode），注意：目前还按 child_phys 的列下标来写
-    duckdb::vector<BoundOrderByNode> orders;
-    orders.reserve(sort->numCols);
-
-    for (int i = 0; i < sort->numCols; i++) {
-        AttrNumber resno = sort->sortColIdx[i];
-
-        TargetEntry *tle = nullptr;
-        for (ListCell *lc = list_head(plan_node->targetlist);
-             lc != nullptr;
-             lc = lnext(plan_node->targetlist, lc)) {
-            auto *cur = (TargetEntry *) lfirst(lc);
-            if (cur->resno == resno) {
-                tle = cur;
-                break;
-            }
+        // 列名：用和 Agg 那边一样的策略选 alias
+        std::string cname = ChooseAliasFromPG((Expr *)tle->expr, tle);
+        if (cname.empty()) {
+            cname = "col" + std::to_string((int)resno - 1);
         }
-        if (!tle) {
-            ereport(ERROR,
-                    (errmsg("CreatePlanSort: cannot find TargetEntry for sortColIdx %d",
-                            (int)resno)));
-        }
+        key_names.push_back(cname);
 
-        // 把 ORDER BY expr 映射成 DuckDB 表达式
-        auto key_expr = map_pg_expr((Node *)tle->expr);
-        if (!key_expr) {
-            ereport(ERROR,
-                    (errmsg("CreatePlanSort: map_pg_expr returned null for sort key")));
-        }
-
-        // 方向
+        // 排序方向
         Oid sortop = sort->sortOperators[i];
         bool reverse = false;
         Oid eq_op = get_equality_op_for_ordering_op(sortop, &reverse);
@@ -2268,27 +2270,29 @@ PgPhysicalPlanGenerator::CreatePlanSort(Sort *sort) {
         }
         OrderType order_type = reverse ? OrderType::DESCENDING
                                        : OrderType::ASCENDING;
+        key_order_type.push_back(order_type);
 
-        // NULLS FIRST/LAST
+        // NULLS FIRST / LAST
         bool nulls_first = sort->nullsFirst[i];
-        OrderByNullType null_order = nulls_first
-                                     ? OrderByNullType::NULLS_FIRST
-                                     : OrderByNullType::NULLS_LAST;
-
-        orders.emplace_back(order_type, null_order, std::move(key_expr));
+        OrderByNullType null_order =
+            nulls_first ? OrderByNullType::NULLS_FIRST
+                        : OrderByNullType::NULLS_LAST;
+        key_null_order.push_back(null_order);
     }
 
-    // ----------------------------
-    // ★ 5. 在 Sort 下面加压缩投影 ★
-    // ----------------------------
-    PhysicalOperator *order_child = &child_phys;
+    // 是否存在“字符串排序键”，决定要不要做压缩 / 解压
     bool has_string_key = false;
     for (auto f : key_is_string) {
-        if (f) { has_string_key = true; break; }
+        if (f) {
+            has_string_key = true;
+            break;
+        }
     }
 
+    // 压缩后 key 的类型（一般是 UTINYINT）
+    LogicalType compress_key_type = LogicalType::UTINYINT;
     if (has_string_key) {
-        // 5.1 从 Catalog 里取压缩函数定义
+        // 从 Catalog 里把压缩函数的返回类型拿出来，避免写死 UTINYINT
         auto &catalog = duckdb::Catalog::GetSystemCatalog(context);
         auto &compress_entry =
             catalog.GetEntry<duckdb::ScalarFunctionCatalogEntry>(
@@ -2299,13 +2303,34 @@ PgPhysicalPlanGenerator::CreatePlanSort(Sort *sort) {
             );
         auto &compress_set = compress_entry.functions;
 
-        // 假设每个 candidate 的参数类型是 VARCHAR，返回 UTINYINT（实际以你 headers 为准）
         duckdb::vector<duckdb::LogicalType> compress_arg_types;
         compress_arg_types.push_back(duckdb::LogicalType::VARCHAR);
-        auto compress_fun =
+        duckdb::ScalarFunction compress_fun =
             compress_set.GetFunctionByArguments(context, compress_arg_types);
 
-        // 5.2 构造一个新的 Projection：对“排序键对应列且为 string 的列”做 compress()
+        compress_key_type = compress_fun.return_type; // 一般是 UTINYINT
+    }
+
+    // 从这里开始构造物理树
+    duckdb::PhysicalOperator *order_child = &child_phys;
+
+    // ---------- 4) 在 ORDER_BY 下面插入压缩 PROJECTION ----------
+    if (has_string_key) {
+        auto &catalog = duckdb::Catalog::GetSystemCatalog(context);
+        auto &compress_entry =
+            catalog.GetEntry<duckdb::ScalarFunctionCatalogEntry>(
+                context,
+                INVALID_CATALOG,
+                DEFAULT_SCHEMA,
+                "__internal_compress_string_utinyint"
+            );
+        auto &compress_set = compress_entry.functions;
+
+        duckdb::vector<duckdb::LogicalType> compress_arg_types;
+        compress_arg_types.push_back(duckdb::LogicalType::VARCHAR);
+        duckdb::ScalarFunction compress_fun =
+            compress_set.GetFunctionByArguments(context, compress_arg_types);
+
         duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> proj_exprs;
         duckdb::vector<duckdb::LogicalType>                    proj_types;
 
@@ -2313,28 +2338,25 @@ PgPhysicalPlanGenerator::CreatePlanSort(Sort *sort) {
         proj_exprs.reserve(child_types.size());
         proj_types.reserve(child_types.size());
 
-        // 这里采用“全列重写”的简单方案：
-        // - 对于参与排序且是字符串的列：compress(col)
-        // - 否则：直接 BoundColumnRef 原列
         for (idx_t col = 0; col < child_types.size(); col++) {
-            // 判断这个 col 是否参与排序且是 string key
-            bool this_is_string_sort_key = false;
-            for (idx_t k = 0; k < key_is_string.size(); k++) {
-                if (!key_is_string[k]) continue;
-                // 这里简化假设：第 k 个排序键就是第 k 列；更严谨的做法要从
-                // orders[k].expression 的 BoundColumnRef 里抽 colidx 来比对
-                if (k == col) {
-                    this_is_string_sort_key = true;
+            // 判断这个列是不是“字符串排序键对应的列”
+            bool this_is_string_sort_col = false;
+            for (idx_t k = 0; k < sort_col_indices.size(); k++) {
+                if (!key_is_string[k]) {
+                    continue;
+                }
+                if (sort_col_indices[k] == col) {
+                    this_is_string_sort_col = true;
                     break;
                 }
             }
 
-            if (this_is_string_sort_key) {
-                // 压缩：compress_fun(child_col)
+            if (this_is_string_sort_col) {
+                // compress_fun(原始列)
                 duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> fun_args;
                 fun_args.push_back(
                     duckdb::make_uniq<duckdb::BoundColumnRefExpression>(
-                        "#" + std::to_string(col),          // ★ 这里给 alias，避免 #[0.x]
+                        "#" + std::to_string(col),                    // alias 暂不重要
                         child_types[col],
                         duckdb::ColumnBinding(0, col)
                     )
@@ -2350,11 +2372,11 @@ PgPhysicalPlanGenerator::CreatePlanSort(Sort *sort) {
                 proj_types.push_back(compress_fun.return_type);
                 proj_exprs.push_back(std::move(fun_expr));
             } else {
-                // 原样透传
+                // 非字符串排序键或者非排序列，原样透传
                 proj_types.push_back(child_types[col]);
                 proj_exprs.push_back(
                     duckdb::make_uniq<duckdb::BoundColumnRefExpression>(
-                        "#" + std::to_string(col),          // ★ 这里给 alias，避免 #[0.x]
+                        "#" + std::to_string(col) ,
                         child_types[col],
                         duckdb::ColumnBinding(0, col)
                     )
@@ -2369,14 +2391,41 @@ PgPhysicalPlanGenerator::CreatePlanSort(Sort *sort) {
         );
         compress_proj.children.push_back(*order_child);
         order_child = &compress_proj;
-
-        // 5.3 注意：严格来说，这里还要把 orders[k].expression 改成指向“压缩后列”
-        // 但如果我们保持“第 k 个排序键 == 第 k 列”的约定，
-        // 而且 Projection 也是把压缩结果放在同一个列位上，
-        // 那么 orders 里原来的 BoundColumnRef(ColumnBinding(0,k)) 就自动指向压缩的那个列了。
+        // 到这里为止：order_child->types 里，那些字符串排序列已经是压缩后的类型
     }
 
-    // 6.  projection_map：恒等映射
+    // ---------- 5) 基于“压缩后的 child”重建 BoundOrderByNode ----------
+    duckdb::vector<BoundOrderByNode> orders;
+    orders.reserve(sort->numCols);
+
+    auto &order_child_types = order_child->types;
+
+    for (int i = 0; i < sort->numCols; i++) {
+        idx_t col_idx = sort_col_indices[i];
+        if (col_idx >= order_child_types.size()) {
+            ereport(ERROR,
+                    (errmsg("CreatePlanSort: sortColIdx %zu out of range (child has %zu cols)",
+                            (size_t)col_idx,
+                            (size_t)order_child_types.size())));
+        }
+
+        // ★ 关键：这里 alias 设成 key_names[i]，所以 ToString 会打印列名，而不是 #[0.0] ★
+        const std::string &cname = key_names[i];
+
+        auto key_expr = duckdb::make_uniq<duckdb::BoundColumnRefExpression>(
+            cname,                        // alias = 真实列名，如 "l_orderkey"
+            order_child_types[col_idx],   // 类型已是压缩后的（如果是字符串排序列）
+            duckdb::ColumnBinding(0, col_idx)
+        );
+
+        orders.emplace_back(
+            key_order_type[i],
+            key_null_order[i],
+            std::move(key_expr)
+        );
+    }
+
+    // ---------- 6) projection_map：恒等映射 ----------
     duckdb::vector<idx_t> projection_map;
     projection_map.reserve(order_child->types.size());
     for (idx_t i = 0; i < order_child->types.size(); i++) {
@@ -2388,28 +2437,24 @@ PgPhysicalPlanGenerator::CreatePlanSort(Sort *sort) {
         estimated_card = 1;
     }
 
-    // 7. 创建 PhysicalOrder
+    // ---------- 7) 创建 PhysicalOrder ----------
     auto &order = Make<duckdb::PhysicalOrder>(
-        order_child->types,     // types 与 order_child 一致
+        order_child->types,     // 排序不改变列类型
         std::move(orders),
         std::move(projection_map),
         estimated_card
     );
     order.children.push_back(*order_child);
 
-    // 8. 如果没有字符串排序键，不需要顶层解压 Projection，直接返回 order
+    // ---------- 8) 顶层“解压 PROJECTION” ----------
     if (!has_string_key) {
+        // 没有字符串排序键，就不需要解压层，直接返回 ORDER_BY
         return order;
     }
 
-    // 9. 顶层解压 Projection：把前面的压缩列恢复成 VARCHAR
-    //   PROJECTION
-    //     __internal_decompress_string(#0)
-    //     __internal_decompress_string(#1)
-    //     #2, #3, ...
-    auto &catalog = duckdb::Catalog::GetSystemCatalog(context);
+    auto &catalog2 = duckdb::Catalog::GetSystemCatalog(context);
     auto &decompress_entry =
-        catalog.GetEntry<duckdb::ScalarFunctionCatalogEntry>(
+        catalog2.GetEntry<duckdb::ScalarFunctionCatalogEntry>(
             context,
             INVALID_CATALOG,
             DEFAULT_SCHEMA,
@@ -2417,55 +2462,64 @@ PgPhysicalPlanGenerator::CreatePlanSort(Sort *sort) {
         );
     auto &decompress_set = decompress_entry.functions;
 
-    // 假设 decompress 接受 compress_fun.return_type，返回 VARCHAR
+    // 解压函数参数类型 = 压缩后的 key 类型
     duckdb::vector<duckdb::LogicalType> decompress_arg_types;
-    decompress_arg_types.push_back(/* compress_fun.return_type */ duckdb::LogicalType::UTINYINT);
-    auto decompress_fun =
+    decompress_arg_types.push_back(compress_key_type);
+
+    duckdb::ScalarFunction decompress_fun =
         decompress_set.GetFunctionByArguments(context, decompress_arg_types);
 
     duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> top_proj_exprs;
     duckdb::vector<duckdb::LogicalType>                    top_proj_types;
 
-    auto &ord_out_types = order.types;
-    top_proj_exprs.reserve(ord_out_types.size());
-    top_proj_types.reserve(ord_out_types.size());
+    auto &agg_out_types = order.types;
+    top_proj_exprs.reserve(agg_out_types.size());
+    top_proj_types.reserve(agg_out_types.size());
 
-    for (idx_t col = 0; col < ord_out_types.size(); col++) {
-        bool this_is_string_sort_key = false;
-        for (idx_t k = 0; k < key_is_string.size(); k++) {
-            if (!key_is_string[k]) continue;
-            if (k == col) {
-                this_is_string_sort_key = true;
+    for (idx_t col = 0; col < agg_out_types.size(); col++) {
+        bool this_is_compressed_sort_col = false;
+
+        // 判断当前列是不是被压缩过的排序列（通过 sort_col_indices + key_is_string）
+        for (idx_t k = 0; k < sort_col_indices.size(); k++) {
+            if (!key_is_string[k]) {
+                continue;
+            }
+            if (sort_col_indices[k] == col) {
+                this_is_compressed_sort_col = true;
                 break;
             }
         }
 
-        if (this_is_string_sort_key) {
-            // 解压：decompress_fun(#col)
+        if (this_is_compressed_sort_col) {
+            // 构造 decompress_fun(#col)
             duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> fun_args;
             fun_args.push_back(
                 duckdb::make_uniq<duckdb::BoundColumnRefExpression>(
-                    "#" + std::to_string(col),          // ★ 这里给 alias，避免 #[0.x]
-                    ord_out_types[col],
+                    "#" + std::to_string(col),  // 输入列 alias 不重要
+                    agg_out_types[col],
                     duckdb::ColumnBinding(0, col)
                 )
             );
+
             auto fun_expr = duckdb::make_uniq<duckdb::BoundFunctionExpression>(
-                decompress_fun.return_type,   // VARCHAR
+                decompress_fun.return_type,   // 一般是 VARCHAR
                 decompress_fun,
                 std::move(fun_args),
                 nullptr
             );
 
+            // ★ 不要设置 alias，让 ToString 打印 __internal_decompress_string(...) ★
+            // fun_expr->alias = key_names[k];   // 这行不要写
+
             top_proj_types.push_back(decompress_fun.return_type);
             top_proj_exprs.push_back(std::move(fun_expr));
         } else {
-            // 非排序键或非字符串：直接透传
-            top_proj_types.push_back(ord_out_types[col]);
+            // 非压缩列：直接透传
+            top_proj_types.push_back(agg_out_types[col]);
             top_proj_exprs.push_back(
                 duckdb::make_uniq<duckdb::BoundColumnRefExpression>(
-                    "#" + std::to_string(col),          // ★ 这里给 alias，避免 #[0.x]
-                    ord_out_types[col],
+                    "#" + std::to_string(col) ,  // alias 空，打印成 #[0.x] 也无所谓
+                    agg_out_types[col],
                     duckdb::ColumnBinding(0, col)
                 )
             );
@@ -2607,3 +2661,41 @@ duckdb_physical_plan_free(void *plan_ptr) {
     delete plan;
 }
 
+
+
+extern "C" const char *dbg_expr_detail(duckdb::Expression *expr) {
+    static std::string last;
+
+    if (!expr) {
+        last = "<null>";
+        return last.c_str();
+    }
+
+    std::string base = expr->ToString();
+
+    auto *ref = dynamic_cast<duckdb::BoundReferenceExpression *>(expr);
+    auto *fn  = dynamic_cast<duckdb::BoundFunctionExpression *>(expr);
+
+    if (ref) {
+        last = duckdb::StringUtil::Format(
+            "%s [BoundRef index=%d type=%s]",
+            base.c_str(),
+            (int)ref->index,
+            ref->return_type.ToString().c_str()
+        );
+    } else if (fn) {
+        last = duckdb::StringUtil::Format(
+            "%s [BoundFunc name=%s return=%s]",
+            base.c_str(),
+            fn->function.name.c_str(),
+            fn->return_type.ToString().c_str()
+        );
+    } else {
+        last = duckdb::StringUtil::Format(
+            "%s [type=%s]",
+            base.c_str(),
+            expr->return_type.ToString().c_str()
+        );
+    }
+    return last.c_str();
+}
