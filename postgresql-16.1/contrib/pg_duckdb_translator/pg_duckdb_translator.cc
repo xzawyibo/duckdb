@@ -135,6 +135,10 @@
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/common/to_string.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/catalog/catalog.hpp"
+#include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
+#include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
+
 
 
 extern "C" {
@@ -1282,89 +1286,7 @@ PgPhysicalPlanGenerator::CreatePlan(Plan *plan) {
     }
 }
 
-
-// ，用于 DuckDB Expression::alias打印列名
-// 逻辑：
-//  1) 有 TargetEntry 且 resname 非空 → 用 resname
-//  2) 否则，从 expr 里找第一个 Var：
-//       - 只接受 varlevelsup=0 且 varno 落在 pstmt->rtable 范围内
-//       - 对应 RTE_RELATION → 从 pg_attribute 拿 attname
-//  3) 都拿不到就返回空字符串，由调用者决定是否保留原 alias
-
-std::string PgPhysicalPlanGenerator::ChooseAliasFromPG(Expr *expr, TargetEntry *tle) {
-    // 1) 优先 TLE 的 resname（比如 SELECT sum(l_quantity) AS sum_qty）
-    if (tle && tle->resname && tle->resname[0] != '\0') {
-        return std::string(tle->resname);
-    }
-
-    // 2) 从 expr 中找 base table 的 Var
-    //    我们写一个内部小 helper：递归剥掉 RelabelType / FuncExpr 等 wrapper
-    std::function<Var *(Node *)> find_var = [&](Node *node) -> Var * {
-        if (!node) return nullptr;
-        if (IsA(node, Var)) {
-            return (Var *)node;
-        }
-
-        if (IsA(node, RelabelType)) {
-            RelabelType *rt = (RelabelType *)node;
-            return find_var((Node *)rt->arg);
-        }
-        if (IsA(node, FuncExpr)) {
-            FuncExpr *fe = (FuncExpr *)node;
-            if (fe->args != NIL) {
-                ListCell *lc;
-                foreach (lc, fe->args) {
-                    Var *v = find_var((Node *)lfirst(lc));
-                    if (v) return v;
-                }
-            }
-            return nullptr;
-        }
-        // 其它节点类型需要的话后面再扩展
-        return nullptr;
-    };
-
-    Var *v = find_var((Node *)expr);
-    if (!v) {
-        return std::string(); // 空，交给调用者保留原 alias
-    }
-
-    // 只处理 varlevelsup=0 且 varno 在 rtable 范围内的普通 Var
-    if (v->varlevelsup != 0) {
-        return std::string();
-    }
-    if (!pstmt) {
-        return std::string();
-    }
-
-    int rtable_len = list_length(pstmt->rtable);
-    if (v->varno <= 0 || v->varno > rtable_len) {
-        return std::string();
-    }
-
-    RangeTblEntry *rte = rt_fetch(v->varno, pstmt->rtable);
-    if (!rte || rte->rtekind != RTE_RELATION) {
-        return std::string();
-    }
-
-    struct RelationData *rel = table_open(rte->relid, AccessShareLock);
-    std::string result;
-
-    TupleDesc tupdesc = RelationGetDescr(rel);
-    if (v->varattno > 0 && v->varattno <= tupdesc->natts) {
-        Form_pg_attribute attr = TupleDescAttr(tupdesc, v->varattno - 1);
-        if (!attr->attisdropped) {
-            const char *attname = NameStr(attr->attname);
-            if (attname && attname[0] != '\0') {
-                result = std::string(attname);  // 比如 "l_returnflag"
-            }
-        }
-    }
-
-    table_close(rel, AccessShareLock);
-    return result; // 可能为空字符串，调用方要判断
-}
-
+/*scan算子
 duckdb::PhysicalOperator &
 PgPhysicalPlanGenerator::CreatePlanSeqScan(SeqScan *scan) {
     using namespace duckdb;
@@ -1470,9 +1392,9 @@ PgPhysicalPlanGenerator::CreatePlanSeqScan(SeqScan *scan) {
     output_types.reserve(returned_types.size());
     output_names.reserve(column_names.size());
 
-    /*对 projection_ids 里的每一个 index：
+    对 projection_ids 里的每一个 index：
     从 returned_types[proj_idx] 取 type， push 到 output_types；
-    从 column_names[proj_idx] 取 name， push 到 output_names。*/
+    从 column_names[proj_idx] 取 name， push 到 output_names。
 
     for (auto proj_idx : projection_ids) {
         output_types.push_back(returned_types[proj_idx]);
@@ -1526,48 +1448,201 @@ PgPhysicalPlanGenerator::CreatePlanSeqScan(SeqScan *scan) {
     table_close(rel, AccessShareLock);
     return scan_op;
 
-
-    // 如果让所有 SeqScan 上面都加一层 Projection：
-    // duckdb::vector<LogicalType> proj_types;
-    // duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> proj_exprs;
-
-    // for (ListCell *lc1 = list_head(plan_node->targetlist);
-    //      lc1 != NULL;
-    //      lc1 = lnext(plan_node->targetlist, lc1)) {
-
-    //     TargetEntry *tle = (TargetEntry *) lfirst(lc1);
-    //     if (!tle || tle->resjunk) {
-    //         continue;
-    //     }
-
-    //     auto expr = map_pg_expr((Node *)tle->expr);
-    //     if (!expr) {
-    //         expr = duckdb::make_uniq<duckdb::BoundConstantExpression>(duckdb::Value());
-    //     }
-
-    //     Oid   typid  = exprType((Node *)tle->expr);
-    //     int32 typmod = exprTypmod((Node *)tle->expr);
-    //     auto ltype   = PgTypeOidToDuckType(typid, typmod);
-
-    //     proj_types.push_back(ltype);
-    //     proj_exprs.push_back(std::move(expr));
-    // }
-
-    // // idx_t estimated_card = (idx_t)plan_node->plan_rows;
-    // if (estimated_card == 0) {
-    //     estimated_card = 1;
-    // }
-
-    // auto &proj = Make<PhysicalProjection>(
-    //     std::move(proj_types),
-    //     std::move(proj_exprs),
-    //     estimated_card
-    // );
-    // proj.children.push_back(scan_op);
-    // return proj;
-
-
 }
+*/
+
+// --------------------------------------------
+// 1) DuckDB runtime: in-memory DB + Connection
+// --------------------------------------------
+struct DuckRuntime {
+    DuckDB db;
+    Connection conn;
+    bool q1_ready = false;
+
+    DuckRuntime() : db(nullptr), conn(db) {} // nullptr => in-memory
+};
+
+static DuckRuntime &GetDuckRuntime() {
+    static DuckRuntime rt;
+    return rt;
+}
+
+// ----------------------------------------------------------
+// 2) Q1 test init: create main.lineitem + insert exactly 1 row
+// ----------------------------------------------------------
+static void EnsureDuckdbQ1TestData() {
+    auto &rt = GetDuckRuntime();
+    if (rt.q1_ready) {
+        return;
+    }
+
+    auto res = rt.conn.Query("CREATE SCHEMA IF NOT EXISTS main;");
+    if (res->HasError()) {
+        throw std::runtime_error("DuckDB create schema failed: " + res->GetError());
+    }
+
+    // TPCH lineitem 标准 16 列（按顺序）
+    // 为了先跑通：NUMERIC/DECIMAL 统一用 DOUBLE；CHAR(1) 用 VARCHAR
+    std::string ddl = R"SQL(
+    CREATE TABLE IF NOT EXISTS main.lineitem (
+        l_orderkey      BIGINT,
+        l_partkey       BIGINT,
+        l_suppkey       BIGINT,
+        l_linenumber    INTEGER,
+        l_quantity      DOUBLE,
+        l_extendedprice DOUBLE,
+        l_discount      DOUBLE,
+        l_tax           DOUBLE,
+        l_returnflag    VARCHAR,
+        l_linestatus    VARCHAR,
+        l_shipdate      DATE,
+        l_commitdate    DATE,
+        l_receiptdate   DATE,
+        l_shipinstruct  VARCHAR,
+        l_shipmode      VARCHAR,
+        l_comment       VARCHAR
+    );
+    )SQL";
+
+    res = rt.conn.Query(ddl);
+    if (res->HasError()) {
+        throw std::runtime_error("DuckDB create lineitem failed: " + res->GetError());
+    }
+
+    // 保证幂等：每次 backend 初始化只留 1 行
+    res = rt.conn.Query("DELETE FROM main.lineitem;");
+    if (res->HasError()) {
+        throw std::runtime_error("DuckDB delete lineitem failed: " + res->GetError());
+    }
+
+    // 插入 1 行测试数据（足够验证 scan->filter->agg->order 这条链路是否“能跑”）
+    std::string ins = R"SQL(
+    INSERT INTO main.lineitem VALUES
+    (1, 1, 1, 1,
+     17.0, 1000.0, 0.04, 0.02,
+     'N', 'O',
+     DATE '1998-09-02', DATE '1998-08-30', DATE '1998-09-10',
+     'DELIVER IN PERSON', 'AIR', 'test row');
+    )SQL";
+
+    res = rt.conn.Query(ins);
+    if (res->HasError()) {
+        throw std::runtime_error("DuckDB insert test row failed: " + res->GetError());
+    }
+
+    rt.q1_ready = true;
+}
+
+duckdb::PhysicalOperator &
+PgPhysicalPlanGenerator::CreatePlanSeqScan(SeqScan *scan) {
+    using namespace duckdb;
+
+    EnsureDuckdbQ1TestData();
+
+    Scan *scan_node = (Scan *)scan;
+    RangeTblEntry *rte = rt_fetch(scan_node->scanrelid, pstmt->rtable);
+    if (!rte || rte->rtekind != RTE_RELATION) {
+        ereport(ERROR, (errmsg("CreatePlanSeqScan: only base relation supported")));
+    }
+
+    const char *pg_table_name = get_rel_name(rte->relid);
+    if (!pg_table_name) {
+        ereport(ERROR, (errmsg("CreatePlanSeqScan: get_rel_name failed")));
+    }
+    if (strcmp(pg_table_name, "lineitem") != 0) {
+        ereport(ERROR, (errmsg("Q1-only mode: only table 'lineitem' supported, got '%s'", pg_table_name)));
+    }
+
+    std::string schema_name = "main";
+    std::string table_name  = "lineitem";
+
+    
+
+    // 1) catalog lookup：现在 TableCatalogEntry 是完整类型了
+    auto &catalog = Catalog::GetSystemCatalog(context);
+    auto &table_entry = catalog.GetEntry<TableCatalogEntry>(
+        context,
+        INVALID_CATALOG,
+        schema_name,
+        table_name
+    );
+    
+    // 3) 准备 scan columns：全 16 列
+    //    注意：column_ids 是“底表列号”(0-based)
+    duckdb::vector<LogicalType> returned_types = {
+        LogicalType::BIGINT,   // l_orderkey
+        LogicalType::BIGINT,   // l_partkey
+        LogicalType::BIGINT,   // l_suppkey
+        LogicalType::INTEGER,  // l_linenumber
+        LogicalType::DOUBLE,   // l_quantity
+        LogicalType::DOUBLE,   // l_extendedprice
+        LogicalType::DOUBLE,   // l_discount
+        LogicalType::DOUBLE,   // l_tax
+        LogicalType::VARCHAR,  // l_returnflag
+        LogicalType::VARCHAR,  // l_linestatus
+        LogicalType::DATE,     // l_shipdate
+        LogicalType::DATE,     // l_commitdate
+        LogicalType::DATE,     // l_receiptdate
+        LogicalType::VARCHAR,  // l_shipinstruct
+        LogicalType::VARCHAR,  // l_shipmode
+        LogicalType::VARCHAR   // l_comment
+    };
+
+
+    duckdb::vector<string> column_names = {
+        "l_orderkey","l_partkey","l_suppkey","l_linenumber",
+        "l_quantity","l_extendedprice","l_discount","l_tax",
+        "l_returnflag","l_linestatus",
+        "l_shipdate","l_commitdate","l_receiptdate",
+        "l_shipinstruct","l_shipmode","l_comment"
+    };
+
+    duckdb::vector<ColumnIndex> column_ids;
+    duckdb::vector<idx_t> projection_ids;
+    for (idx_t i = 0; i < 16; i++) {
+        column_ids.push_back(ColumnIndex((column_t)i)); // base column index
+        projection_ids.push_back(i);                    // output = returned (identity)
+    }
+
+    // scan 的输出 schema： = 全列输出（让上层 Projection/Agg 自己处理）
+    duckdb::vector<LogicalType> output_types = returned_types;
+
+
+    // 2) 用 duckdb::unique_ptr（不是 std::unique_ptr）
+    duckdb::unique_ptr<FunctionData> bind_data;
+
+    // 3) 真实 GetScanFunction + 真实 bind_data（可执行）
+    //    你之前写的 table_entry.GetScanFunction(context, bind_data) 现在能编译了
+    TableFunction table_func = table_entry.GetScanFunction(context, bind_data);
+
+    // ===== 下面这些你原来已有的 returned_types/column_ids/projection_ids/... 构造逻辑保持即可 =====
+
+    duckdb::unique_ptr<TableFilterSet> table_filters; // 先不下推过滤，跑通后再加
+
+    idx_t estimated_card = 1;
+    ExtraOperatorInfo extra_info;
+    duckdb::vector<Value> parameters;
+    duckdb::virtual_column_map_t virtual_columns;
+
+    // 注意：构造 PhysicalTableScan 的第3个参数是 TableFunction（按值），建议 move
+    auto &scan_op = Make<PhysicalTableScan>(
+        std::move(output_types),
+        std::move(table_func),            // <- 这里 move 掉
+        std::move(bind_data),             // <- duckdb::unique_ptr
+        std::move(returned_types),
+        std::move(column_ids),
+        std::move(projection_ids),
+        std::move(column_names),
+        std::move(table_filters),         // <- duckdb::unique_ptr
+        estimated_card,
+        std::move(extra_info),
+        std::move(parameters),
+        std::move(virtual_columns)
+    );
+
+    return scan_op;
+}
+
 
 duckdb::PhysicalOperator &
 PgPhysicalPlanGenerator::CreatePlanResult(Result *res) {
@@ -2309,7 +2384,6 @@ PgPhysicalPlanGenerator::CreatePlanAgg(Agg *agg) {
     return top_proj;
 }
 
-
 duckdb::PhysicalOperator &
 PgPhysicalPlanGenerator::CreatePlanSort(Sort *sort) {
     using namespace duckdb;
@@ -2675,8 +2749,14 @@ PgPhysicalPlanGenerator::CreatePlanSort(Sort *sort) {
     );
     top_proj.children.push_back(order);
 
+    top_proj.Print();
+
     return top_proj;
+
 }
+
+
+
 
 
 extern "C" bool
@@ -2688,8 +2768,7 @@ pg_to_duckdb_physical_plan(void *stmt_ptr, void **out_plan_ptr, char **error_msg
 
     //新的上下文开始
     // 1. 建一个“长期存活”的 DuckDB 实例和连接（避免 plan 指向已销毁 allocator）
-    static duckdb::DuckDB db;
-    static duckdb::Connection conn(db);
+    auto &rt = GetDuckRuntime();
 
     try {
         PlannedStmt *pstmt = reinterpret_cast<PlannedStmt *>(stmt_ptr);
@@ -2698,11 +2777,13 @@ pg_to_duckdb_physical_plan(void *stmt_ptr, void **out_plan_ptr, char **error_msg
             return false;
         }
         
-        
         // 1.1 防御性 ROLLBACK：如果上一次事务是 aborted，这里先清理掉
         {
-            auto rb = conn.Query("ROLLBACK");
+            auto rb = rt.conn.Query("ROLLBACK");
         }
+
+        // 初始化 DuckDB Q1 表 + 插 1 行（关键）
+        EnsureDuckdbQ1TestData();
 
         // // 1. 创建 DuckDB 实例 + 连接，拿 ClientContext
         // // 1. 建一个“长期存活”的 DuckDB 实例和连接（避免 plan 指向已销毁 allocator）
@@ -2722,26 +2803,25 @@ pg_to_duckdb_physical_plan(void *stmt_ptr, void **out_plan_ptr, char **error_msg
 
         // 2. 显式开启一个 DuckDB 事务（关键！）
     
-        auto begin_res = conn.Query("BEGIN TRANSACTION");
+        auto begin_res = rt.conn.Query("BEGIN TRANSACTION");
         if (begin_res->HasError()) {
             set_error(error_msg, begin_res->GetError().c_str());
             return false;
         }
 
 
-        duckdb::ClientContext &ctx = *conn.context;
+        duckdb::ClientContext &ctx = *rt.conn.context;
 
 
         // 3. 用这个带事务的 context 做计划翻译
         PgPhysicalPlanGenerator gen(ctx);
         std::unique_ptr<duckdb::PhysicalPlan> plan = gen.PlanFromPlannedStmt(pstmt);
 
-
         // 提交事务（这里只做 catalog 查找/函数绑定，不改数据）
-        auto commit_res = conn.Query("COMMIT");
+        auto commit_res = rt.conn.Query("COMMIT");
         if (commit_res->HasError()) {
             // 理论上很少出错，如果出错可以再尝试 ROLLBACK
-            auto rb = conn.Query("ROLLBACK");
+            auto rb = rt.conn.Query("ROLLBACK");
             std::string msg = "duckdb COMMIT failed: ";
             msg += commit_res->GetError();
             set_error(error_msg, msg.c_str());
@@ -2753,12 +2833,12 @@ pg_to_duckdb_physical_plan(void *stmt_ptr, void **out_plan_ptr, char **error_msg
         return true;
     } catch (std::exception &ex) {
         // 8. 任何 C++ 异常都尝试回滚 DuckDB 事务
-        auto rb = conn.Query("ROLLBACK");
+        auto rb = rt.conn.Query("ROLLBACK");
         (void)rb; // 忽略 ROLLBACK 的返回错误
         set_error(error_msg, ex.what());
         return false;
     } catch (...) {
-        auto rb = conn.Query("ROLLBACK");
+        auto rb = rt.conn.Query("ROLLBACK");
         (void)rb; // 忽略 ROLLBACK 的返回错误
         set_error(error_msg, "unknown error in pg_to_duckdb_physical_plan");
         return false;
