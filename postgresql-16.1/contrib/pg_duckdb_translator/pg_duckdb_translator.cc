@@ -112,7 +112,12 @@
 
 #include "pg_duckdb_mapper.h"
 
-
+// for exectue
+#include "duckdb/main/pending_query_result.hpp"
+#include "duckdb/main/query_result.hpp"
+#include "duckdb/common/enums/statement_type.hpp"
+#include "duckdb/main/prepared_statement_data.hpp"
+#include "duckdb/execution/operator/scan/physical_dummy_scan.hpp"
 
 //新加
 #include "duckdb/catalog/catalog.hpp"
@@ -1687,17 +1692,14 @@ PgPhysicalPlanGenerator::CreatePlanResult(Result *res) {
 
     // --- 3. 调用 Make<PhysicalProjection> 创建算子 ---
     auto &proj = Make<duckdb::PhysicalProjection>(
-        std::move(proj_types),
+        proj_types,
         std::move(proj_exprs),
         estimated_card
     );
 
     // --- 4. 如果有 child，就挂在下面；没有 child（SELECT 1）就先空着 ---
-    Plan *child_plan = outerPlan(plan_node);
-    if (child_plan) {
-        auto &child_phys = CreatePlan(child_plan);
-        proj.children.push_back(child_phys);
-    }
+    auto &child_phys = Make<PhysicalDummyScan>(proj_types, estimated_card);
+    proj.children.push_back(child_phys);
 
     return proj;
 }
@@ -2920,4 +2922,101 @@ extern "C" const char *dbg_expr_detail(duckdb::Expression *expr) {
         );
     }
     return last.c_str();
+}
+
+static vector<string> getOutputColumnNames(PhysicalPlan &plan) {
+    auto &root_op = plan.Root();
+    if (root_op.type == PhysicalOperatorType::TABLE_SCAN)
+        return root_op.Cast<PhysicalTableScan>().names;
+    if (root_op.type == PhysicalOperatorType::PROJECTION) {
+        auto &proj = root_op.Cast<PhysicalProjection>();
+        vector<string> names;
+        for (auto &expr : proj.select_list)
+            names.push_back(expr->GetName());
+        return names;
+    }
+
+    vector<string> names;
+    auto &types = root_op.GetTypes();
+    for (idx_t i = 0; i < types.size(); i++)
+        names.push_back("col" + std::to_string(i));
+
+    return names;
+}
+
+extern "C" bool
+pg_run_duckdb_physical_plan(void *stmt_ptr, void **out_plan_ptr, char **error_msg) {
+    // 1. 建一个“长期存活”的 DuckDB 实例和连接（避免 plan 指向已销毁 allocator）
+    static duckdb::DuckDB db("/home/yzx/duckdb/postgresql-16.1/contrib/duckdb-1.4.2/build/release/t.db");
+    static duckdb::Connection conn(db);
+
+    try {
+        // 1. 开启一个duckdb事务，得到context
+        auto rb = conn.Query("ROLLBACK");
+        auto begin_res = conn.Query("BEGIN TRANSACTION");
+        if (begin_res->HasError()) {
+            set_error(error_msg, begin_res->GetError().c_str());
+            return false;
+        }
+
+        // 2.生成duckdb执行计划
+        PlannedStmt *pstmt = reinterpret_cast<PlannedStmt *>(stmt_ptr);
+        duckdb::ClientContext &ctx = *conn.context;
+
+        PgPhysicalPlanGenerator gen(ctx);
+        unique_ptr<duckdb::PhysicalPlan> plan = gen.PlanFromPlannedStmt(pstmt);
+
+        // 3. 生成可执行prepared plan
+        shared_ptr<PreparedStatementData> prepared = make_shared_ptr<PreparedStatementData>(StatementType::SELECT_STATEMENT);
+        auto prep = make_shared_ptr<StatementProperties>();
+        prepared->properties = *prep;
+        prepared->names = getOutputColumnNames(*plan);
+
+        auto &root_op = plan->Root();
+        prepared->types = root_op.types;
+        prepared->value_map  = {};
+
+        prepared->physical_plan = std::move(plan);
+
+        // 交给执行器
+        PendingQueryParameters parameters;
+        ctx.CheckIfPreparedStatementIsExecutable(*prepared);
+        {
+            // 锁的生命周期
+            auto lock = ctx.LockContext();
+            ctx.BeginQueryInternal(*lock, "select 1");
+            auto pending = ctx.PendingPreparedStatementInternal(*lock, move(prepared), parameters);
+
+            if (pending->HasError()) {
+                string str = "duckdb Execute failed: " + pending->GetError();
+                set_error(error_msg, str.c_str());
+                return false;
+            }
+            else
+            {
+                unique_ptr<QueryResult> res = ctx.ExecutePendingQueryInternal(*lock, *pending);
+                if (res)
+                {
+                    set_error(error_msg, res->ToString().c_str());
+                    elog(WARNING, "%s", res->ToString().c_str());
+                }
+            }
+        }
+
+
+        // 提交事务（这里只做 catalog 查找/函数绑定，不改数据）
+        rb = conn.Query("ROLLBACK");
+        return true;
+    } catch (std::exception &ex) {
+        // 8. 任何 C++ 异常都尝试回滚 DuckDB 事务
+        auto rb = conn.Query("ROLLBACK");
+        (void)rb; // 忽略 ROLLBACK 的返回错误
+        set_error(error_msg, ex.what());
+        return false;
+    } catch (...) {
+        auto rb = conn.Query("ROLLBACK");
+        (void)rb; // 忽略 ROLLBACK 的返回错误
+        set_error(error_msg, "unknown error in pg_to_duckdb_physical_plan");
+        return false;
+    }
 }

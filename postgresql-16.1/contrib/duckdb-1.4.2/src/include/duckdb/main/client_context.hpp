@@ -225,7 +225,7 @@ public:
 	//! Process an error for display to the user
 	DUCKDB_API void ProcessError(ErrorData &error, const string &query) const;
 
-private:
+public:
 	//! Parse statements and resolve pragmas from a query
 	vector<unique_ptr<SQLStatement>> ParseStatements(ClientContextLock &lock, const string &query);
 	//! Issues a query to the database and returns a Pending Query Result
@@ -306,7 +306,7 @@ private:
 
 	SettingLookupResult TryGetCurrentSettingInternal(const string &key, Value &result) const;
 
-private:
+public:
 	//! Lock on using the ClientContext in parallel
 	mutex context_lock;
 	//! The currently active query context

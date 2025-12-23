@@ -17,5 +17,13 @@ RETURNS text
 AS 'MODULE_PATHNAME', 'pg_duckdb_explain'
 LANGUAGE C STRICT;
 
+CREATE FUNCTION pg_duckdb_run(sql text)
+RETURNS text
+AS 'MODULE_PATHNAME', 'pg_duckdb_run'
+LANGUAGE C STRICT;
+
 COMMENT ON FUNCTION pg_duckdb_explain(text)
 IS 'Translate a Postgres PlannedStmt into a DuckDB physical plan string (EXPLAIN-like output).';
+
+COMMENT ON FUNCTION pg_duckdb_run(text)
+IS 'Translate a Postgres PlannedStmt into a DuckDB physical plan string and run';
