@@ -1291,6 +1291,89 @@ PgPhysicalPlanGenerator::CreatePlan(Plan *plan) {
     }
 }
 
+
+// ，用于 DuckDB Expression::alias打印列名
+// 逻辑：
+//  1) 有 TargetEntry 且 resname 非空 → 用 resname
+//  2) 否则，从 expr 里找第一个 Var：
+//       - 只接受 varlevelsup=0 且 varno 落在 pstmt->rtable 范围内
+//       - 对应 RTE_RELATION → 从 pg_attribute 拿 attname
+//  3) 都拿不到就返回空字符串，由调用者决定是否保留原 alias
+
+std::string PgPhysicalPlanGenerator::ChooseAliasFromPG(Expr *expr, TargetEntry *tle) {
+    // 1) 优先 TLE 的 resname（比如 SELECT sum(l_quantity) AS sum_qty）
+    if (tle && tle->resname && tle->resname[0] != '\0') {
+        return std::string(tle->resname);
+    }
+
+    // 2) 从 expr 中找 base table 的 Var
+    //    我们写一个内部小 helper：递归剥掉 RelabelType / FuncExpr 等 wrapper
+    std::function<Var *(Node *)> find_var = [&](Node *node) -> Var * {
+        if (!node) return nullptr;
+        if (IsA(node, Var)) {
+            return (Var *)node;
+        }
+
+        if (IsA(node, RelabelType)) {
+            RelabelType *rt = (RelabelType *)node;
+            return find_var((Node *)rt->arg);
+        }
+        if (IsA(node, FuncExpr)) {
+            FuncExpr *fe = (FuncExpr *)node;
+            if (fe->args != NIL) {
+                ListCell *lc;
+                foreach (lc, fe->args) {
+                    Var *v = find_var((Node *)lfirst(lc));
+                    if (v) return v;
+                }
+            }
+            return nullptr;
+        }
+        // 其它节点类型需要的话后面再扩展
+        return nullptr;
+    };
+
+    Var *v = find_var((Node *)expr);
+    if (!v) {
+        return std::string(); // 空，交给调用者保留原 alias
+    }
+
+    // 只处理 varlevelsup=0 且 varno 在 rtable 范围内的普通 Var
+    if (v->varlevelsup != 0) {
+        return std::string();
+    }
+    if (!pstmt) {
+        return std::string();
+    }
+
+    int rtable_len = list_length(pstmt->rtable);
+    if (v->varno <= 0 || v->varno > rtable_len) {
+        return std::string();
+    }
+
+    RangeTblEntry *rte = rt_fetch(v->varno, pstmt->rtable);
+    if (!rte || rte->rtekind != RTE_RELATION) {
+        return std::string();
+    }
+
+    struct RelationData *rel = table_open(rte->relid, AccessShareLock);
+    std::string result;
+
+    TupleDesc tupdesc = RelationGetDescr(rel);
+    if (v->varattno > 0 && v->varattno <= tupdesc->natts) {
+        Form_pg_attribute attr = TupleDescAttr(tupdesc, v->varattno - 1);
+        if (!attr->attisdropped) {
+            const char *attname = NameStr(attr->attname);
+            if (attname && attname[0] != '\0') {
+                result = std::string(attname);  // 比如 "l_returnflag"
+            }
+        }
+    }
+
+    table_close(rel, AccessShareLock);
+    return result; // 可能为空字符串，调用方要判断
+}
+
 /*scan算子
 duckdb::PhysicalOperator &
 PgPhysicalPlanGenerator::CreatePlanSeqScan(SeqScan *scan) {
@@ -1647,6 +1730,8 @@ PgPhysicalPlanGenerator::CreatePlanSeqScan(SeqScan *scan) {
 
     return scan_op;
 }
+
+
 
 
 duckdb::PhysicalOperator &
