@@ -167,6 +167,8 @@ extern "C" {
 #include "optimizer/tlist.h"      // get_tle_by_resno
 #include "nodes/nodeFuncs.h"
 #include "parser/parsetree.h"
+#include "optimizer/optimizer.h"
+#include "optimizer/clauses.h" 
 }
 
 using duckdb::PhysicalTableScan; 
@@ -204,160 +206,6 @@ static duckdb::LogicalType PgTypeOidToDuckType(Oid typid, int32 typmod) {
 		throw duckdb::InternalException("PgTypeOidToDuckType: unsupported type oid " + std::to_string((uint32)typid));
 	}
 }
-
-/*用一个自定义的 PgTableFunctionInfo 把 PG 表名塞进 table_func.function_info 里；
-把 table_func.name 改成 "pg_seq_scan"*/
-// struct PgColBinding {
-//     AttrNumber     attno;      // PG 1-based 列号
-//     duckdb::idx_t  local_index;// 在我们这次扫描输出里的列顺序
-//     duckdb::LogicalType type;
-//     std::string    name;
-// };
-
-
-
-// 传 Relation / TupleDesc 进来，完全不碰 DuckDB catalog。
-// static PgColBinding
-// PgVarToPgScanColumn(Var *var,
-//                     Relation rel,
-//                     TupleDesc tupdesc,
-//                     std::vector<duckdb::LogicalType> &returned_types,
-//                     std::vector<std::string> &column_names,
-//                     std::vector<duckdb::ColumnIndex> &column_ids) {
-//     using namespace duckdb;
-
-//     AttrNumber attno = var->varattno; // PG 1-based
-
-//     if (attno <= 0 || attno > tupdesc->natts) {
-//         ereport(ERROR,
-//                 (errmsg("PgVarToPgScanColumn: invalid attno %d", attno)));
-//     }
-
-//     Form_pg_attribute attr = TupleDescAttr(tupdesc, attno - 1);
-//     if (attr->attisdropped) {
-//         ereport(ERROR,
-//                 (errmsg("PgVarToPgScanColumn: dropped column attno %d", attno)));
-//     }
-
-//     const char *attname = NameStr(attr->attname);
-//     Oid atttypid = attr->atttypid;
-//     int32 atttypmod = attr->atttypmod;
-
-//     // 看看这个 attno 是否已经加入 column_ids 里
-//     duckdb::column_t local_idx = (duckdb::column_t)duckdb::DConstants::INVALID_INDEX;
-
-//     // 用列名做 key，这样多次遇到同一列（同名）就复用同一个 local_index
-//     std::string colname = attname ? std::string(attname)
-//                                   : std::string("col") + std::to_string((int)attno);
-
-
-//     // 先看看这个列是不是已经在我们这次扫描的列数组里了
-//     for (column_t i = 0; i < (column_t)column_ids.size(); i++) {
-//         if (column_names[i] == colname) {
-//             local_idx = i;
-//             break;
-//         }
-//     }
-
-//     if (local_idx == duckdb::DConstants::INVALID_INDEX) {
-//         // 这次扫描中新加一列
-//         // local_idx = (duckdb::column_t)column_ids.size();
-//         // column_ids.push_back(duckdb::ColumnIndex(local_idx));          // 本次 scan 中的列号 0..n-1
-//         // column_names.emplace_back(attname ? attname : "");
-//         // returned_types.push_back(PgTypeOidToDuckType(atttypid, atttypmod));
-//         auto table_col_idx = (duckdb::column_t)(attno - 1);   // base table column index (0-based)
-
-//         local_idx = (duckdb::column_t)column_ids.size();      // scan-local index
-//         column_ids.push_back(duckdb::ColumnIndex(table_col_idx));
-
-//         // returned_types 最好也从 DuckDB catalog 拿，避免 PG/DuckDB 类型不一致
-//         // returned_types.push_back(PgTypeOidToDuckType(...)); // 这一行建议别再用
-//         returned_types.push_back(table_entry.GetColumns().GetColumn(table_col_idx).Type()); // 伪码：按你实际 API 调整
-//     }
-
-//     PgColBinding b;
-//     b.attno       = attno;
-//     b.local_index = local_idx;
-//     b.type        = returned_types[local_idx];
-//     b.name        = column_names[local_idx];
-//     return b;
-// }
-
-
-// bool TryBuildComparisonFilterFromQual_Q1_PG(
-//     Expr *qual,
-//     TupleDesc tupdesc,
-//     const std::vector<duckdb::column_t> &attno_to_local, // size >= natts+1
-//     duckdb::TableFilterSet &table_filters) {
-
-//     using namespace duckdb;
-
-//     if (!IsA(qual, OpExpr)) {
-//         return false;
-//     }
-//     auto *opexpr = (OpExpr *)qual;
-//     if (list_length(opexpr->args) != 2) {
-//         return false;
-//     }
-
-//     Expr *arg1 = (Expr *)linitial(opexpr->args);
-//     Expr *arg2 = (Expr *)lsecond(opexpr->args);
-
-//     Var   *var = NULL;
-//     Const *cst = NULL;
-
-//     if (IsA(arg1, Var) && IsA(arg2, Const)) {
-//         var = (Var *)arg1;
-//         cst = (Const *)arg2;
-//     } else if (IsA(arg1, Const) && IsA(arg2, Var)) {
-//         var = (Var *)arg2;
-//         cst = (Const *)arg1;
-//     } else {
-//         return false;
-//     }
-
-//     AttrNumber attno = var->varattno;
-//     if (attno <= 0 || attno >= (int)attno_to_local.size()) {
-//         return false;
-//     }
-//     auto local_idx = attno_to_local[attno];
-//     if (local_idx == duckdb::DConstants::INVALID_INDEX) {
-//         return false;
-//     }
-
-//     // 操作符翻译
-//     const char *opname = get_opname(opexpr->opno);
-//     if (!opname) {
-//         return false;
-//     }
-//     ExpressionType cmp;
-//     if (strcmp(opname, "<=") == 0) cmp = ExpressionType::COMPARE_LESSTHANOREQUALTO;
-//     else if (strcmp(opname, "<") == 0) cmp = ExpressionType::COMPARE_LESSTHAN;
-//     else if (strcmp(opname, "=") == 0) cmp = ExpressionType::COMPARE_EQUAL;
-//     else if (strcmp(opname, ">=") == 0) cmp = ExpressionType::COMPARE_GREATERTHANOREQUALTO;
-//     else if (strcmp(opname, ">") == 0) cmp = ExpressionType::COMPARE_GREATERTHAN;
-//     else return false;
-
-//     if (cst->constisnull) {
-//         return false;
-//     }
-
-//     // Const -> duckdb::Value，用你已有的 PgConstToDuckConst
-//     auto duck_const_expr = PgConstToDuckConst(cst);//auto 是 C++11 的类型自动推导关键字  
-//     /*调用 PgConstToDuckConst 把 PG 的 Const 节点转换成一个 DuckDB 的 BoundConstantExpression，
-//     结果保存在一个智能指针 duck_const_expr 里，类型由 auto 自动推导。auto就是帮你少写一长串类型名
-//     这一行等价于：std::unique_ptr<BoundConstantExpression> duck_const_expr = PgConstToDuckConst(cst);*/
-
-//     if (!duck_const_expr) {
-//         return false;
-//     }
-//     Value constant_val = duck_const_expr->value;
-
-//     auto tf = duckdb::make_uniq<ConstantFilter>(cmp, constant_val);//构造条件op const
-//     table_filters.PushFilter(ColumnIndex(local_idx), std::move(tf));//将构造的条件挂载到通过attno在columid里面对应的列上形成var op const
-
-//     return true;
-// }
 
 
 // ---------------- helper: normalize identifier ----------------
@@ -1483,170 +1331,7 @@ std::string PgPhysicalPlanGenerator::ChooseAliasFromPG(Expr *expr, TargetEntry *
     return result; // 可能为空字符串，调用方要判断
 }
 
-/*scan算子
-duckdb::PhysicalOperator &
-PgPhysicalPlanGenerator::CreatePlanSeqScan(SeqScan *scan) {
-    using namespace duckdb;
 
-    Plan *plan_node = (Plan *)scan;
-    Scan *scan_node = (Scan *)scan;
-
-    // 1. 从 PG 侧拿表信息
-    RangeTblEntry *rte = rt_fetch(scan_node->scanrelid, pstmt->rtable);
-    if (!rte || rte->rtekind != RTE_RELATION) {
-        ereport(ERROR,
-                (errmsg("CreatePlanSeqScan: only base relation supported")));
-    }
-
-    struct RelationData *rel = table_open(rte->relid, AccessShareLock);
-    TupleDesc tupdesc = RelationGetDescr(rel);
-    int natts = tupdesc->natts;
-
-    duckdb::vector<LogicalType> returned_types;
-    duckdb::vector<string>      column_names;
-    duckdb::vector<ColumnIndex>    column_ids;
-    duckdb::vector<idx_t>       projection_ids;
-
-    // attno -> 在上面数组里的 local index
-    vector<column_t>    attno_to_local(natts + 1, DConstants::INVALID_INDEX);
-
-    // ---------- 1) targetlist 中的 Var ----------
-    ListCell *lc;
-    for (lc = list_head(plan_node->targetlist);
-         lc != NULL;
-         lc = lnext(plan_node->targetlist, lc)) {
-
-        TargetEntry *tle = (TargetEntry *)lfirst(lc);
-        if (!IsA(tle->expr, Var)) {
-            continue; // 复杂 expr 上交给上层 Result/Projection
-        }
-        Var *var = (Var *)tle->expr;
-
-        auto binding = PgVarToPgScanColumn(
-            var, rel, tupdesc,
-            returned_types, column_names,
-            column_ids
-        );
-        attno_to_local[binding.attno] = binding.local_index;
-        // projection_ids 只在 targetlist 里 push
-        projection_ids.push_back(binding.local_index);
-    }
-
-    // ---------- 2) qual 里的 Var 也要进 column_ids ----------
-    if (plan_node->qual) {
-        for (lc = list_head(plan_node->qual);
-             lc != NULL;
-             lc = lnext(plan_node->qual, lc)) {
-
-            Expr *qual = (Expr *)lfirst(lc);
-            if (!IsA(qual, OpExpr)) {
-                continue;
-            }
-            auto *op = (OpExpr *)qual;
-            if (list_length(op->args) != 2) {
-                continue;
-            }
-            Expr *arg1 = (Expr *)linitial(op->args);
-            if (!IsA(arg1, Var)) {
-                continue;
-            }
-            Var *var = (Var *)arg1;
-            auto binding = PgVarToPgScanColumn(
-                var, rel, tupdesc,
-                returned_types, column_names,
-                column_ids 
-            );
-            attno_to_local[binding.attno] = binding.local_index;
-        }
-    }
-
-    // ---------- 3) 从 qual 构造 TableFilterSet ----------对第几列（local_index）做过滤
-    unique_ptr<TableFilterSet> table_filters;
-    if (plan_node->qual) {
-        auto logical_filters = make_uniq<TableFilterSet>();
-        for (lc = list_head(plan_node->qual);
-             lc != NULL;
-             lc = lnext(plan_node->qual, lc)) {
-
-            Expr *qual = (Expr *)lfirst(lc);
-            TryBuildComparisonFilterFromQual_Q1_PG(
-                qual, tupdesc, attno_to_local, *logical_filters
-            );
-        }
-        if (!logical_filters->filters.empty()) {
-            table_filters = std::move(logical_filters);
-        }
-    }
-
-    // ---------- 4) 输出 schema ----------
-    // returned_types/column_names：是所有“要读的列”（包括只用于过滤、不输出的列）
-    // duckdb::vector<LogicalType> output_types = returned_types;
-    // duckdb::vector<string>      output_names = column_names;
-
-    //只需要 targetlist 中的列，所以：新建 output_types / output_names
-    std::vector<LogicalType> output_types;
-    std::vector<std::string> output_names;
-    output_types.reserve(returned_types.size());
-    output_names.reserve(column_names.size());
-
-    对 projection_ids 里的每一个 index：
-    从 returned_types[proj_idx] 取 type， push 到 output_types；
-    从 column_names[proj_idx] 取 name， push 到 output_names。
-
-    for (auto proj_idx : projection_ids) {
-        output_types.push_back(returned_types[proj_idx]);
-        output_names.push_back(column_names[proj_idx]);
-    }
-
-    // ---------- 5) 构造假的 TableFunction ----------
-    TableFunction table_func;
-    const char *relname_c = get_rel_name(RelationGetRelid(rel));
-    std::string table_name = relname_c ? std::string(relname_c) : std::string("unknown_pg_table");
-    // 函数名固定成 pg_seq_scan
-    table_func.name = "pg_seq_scan";
-
-    // 把 PG 表名塞进 TableFunctionInfo，方便 explain 里拿出来打印
-    auto tf_info = duckdb::make_uniq<PgTableFunctionInfo>(table_name);
-    table_func.function_info = std::move(tf_info);
-
-    // 2.1 to_string 回调：打印 Table / Type，两行就够
-    table_func.to_string = PgSeqScanToString;
-
-    // 3) 打开 Projections / Filters 的打印开关
-    table_func.projection_pushdown = true;  //这个表函数支持只读某些列，而不是所有列
-    table_func.filter_prune        = true;   // 只打印 projection_ids 中的列,将qual中的列保留在scan 的 returned_types/column_ids
-    table_func.filter_pushdown     = true;//这个表函数支持把上层的 WHERE 条件下推到底层 scan，自己利用这些 filter 去做更高效的读取。
-
-    unique_ptr<FunctionData> bind_data; // 这里不真正执行，只是为了 ToString
-
-    idx_t estimated_card = (idx_t)plan_node->plan_rows;
-    ExtraOperatorInfo extra_info;
-    duckdb::vector<Value>   parameters;
-    // vector<column_t> virtual_columns;
-
-    // virtual_column_map_t 是一个别名，用它
-    duckdb::virtual_column_map_t virtual_columns;
-
-    auto &scan_op = Make<PhysicalTableScan>(
-        std::move(output_types),
-        table_func,
-        std::move(bind_data),
-        std::move(returned_types),
-        std::move(column_ids),
-        std::move(projection_ids),
-        std::move(column_names),
-        std::move(table_filters),
-        estimated_card,
-        std::move(extra_info),
-        std::move(parameters),
-        std::move(virtual_columns)
-    );
-
-    table_close(rel, AccessShareLock);
-    return scan_op;
-
-}
-*/
 
 // --------------------------------------------
 // 1) DuckDB runtime: in-memory DB + Connection
@@ -1730,290 +1415,6 @@ static void EnsureDuckdbQ1TestData() {
     rt.q1_ready = true;
 }
 
-// duckdb::PhysicalOperator &
-// PgPhysicalPlanGenerator::CreatePlanSeqScan(SeqScan *scan) {
-//     using namespace duckdb;
-
-//     EnsureDuckdbQ1TestData();
-
-//     Scan *scan_node = (Scan *)scan;
-//     RangeTblEntry *rte = rt_fetch(scan_node->scanrelid, pstmt->rtable);
-//     if (!rte || rte->rtekind != RTE_RELATION) {
-//         ereport(ERROR, (errmsg("CreatePlanSeqScan: only base relation supported")));
-//     }
-
-//     const char *pg_table_name = get_rel_name(rte->relid);
-//     if (!pg_table_name) {
-//         ereport(ERROR, (errmsg("CreatePlanSeqScan: get_rel_name failed")));
-//     }
-//     if (strcmp(pg_table_name, "lineitem") != 0) {
-//         ereport(ERROR, (errmsg("Q1-only mode: only table 'lineitem' supported, got '%s'", pg_table_name)));
-//     }
-
-//     std::string schema_name = "main";
-//     std::string table_name  = "lineitem";
-
-    
-
-//     // 1) catalog lookup：现在 TableCatalogEntry 是完整类型了
-//     auto &catalog = Catalog::GetSystemCatalog(context);
-//     auto &table_entry = catalog.GetEntry<TableCatalogEntry>(
-//         context,
-//         INVALID_CATALOG,
-//         schema_name,
-//         table_name
-//     );
-    
-//     // 3) 准备 scan columns：全 16 列
-//     //    注意：column_ids 是“底表列号”(0-based)
-//     duckdb::vector<LogicalType> returned_types = {
-//         LogicalType::BIGINT,   // l_orderkey
-//         LogicalType::BIGINT,   // l_partkey
-//         LogicalType::BIGINT,   // l_suppkey
-//         LogicalType::INTEGER,  // l_linenumber
-//         LogicalType::DOUBLE,   // l_quantity
-//         LogicalType::DOUBLE,   // l_extendedprice
-//         LogicalType::DOUBLE,   // l_discount
-//         LogicalType::DOUBLE,   // l_tax
-//         LogicalType::VARCHAR,  // l_returnflag
-//         LogicalType::VARCHAR,  // l_linestatus
-//         LogicalType::DATE,     // l_shipdate
-//         LogicalType::DATE,     // l_commitdate
-//         LogicalType::DATE,     // l_receiptdate
-//         LogicalType::VARCHAR,  // l_shipinstruct
-//         LogicalType::VARCHAR,  // l_shipmode
-//         LogicalType::VARCHAR   // l_comment
-//     };
-
-
-//     duckdb::vector<string> column_names = {
-//         "l_orderkey","l_partkey","l_suppkey","l_linenumber",
-//         "l_quantity","l_extendedprice","l_discount","l_tax",
-//         "l_returnflag","l_linestatus",
-//         "l_shipdate","l_commitdate","l_receiptdate",
-//         "l_shipinstruct","l_shipmode","l_comment"
-//     };
-
-//     duckdb::vector<ColumnIndex> column_ids;
-//     duckdb::vector<idx_t> projection_ids;
-//     for (idx_t i = 0; i < 16; i++) {
-//         column_ids.push_back(ColumnIndex((column_t)i)); // base column index
-//         projection_ids.push_back(i);                    // output = returned (identity)
-//     }
-
-//     // scan 的输出 schema： = 全列输出（让上层 Projection/Agg 自己处理）
-//     duckdb::vector<LogicalType> output_types = returned_types;
-
-
-//     // 2) 用 duckdb::unique_ptr（不是 std::unique_ptr）
-//     duckdb::unique_ptr<FunctionData> bind_data;
-
-//     // 3) 真实 GetScanFunction + 真实 bind_data（可执行）
-//     //    你之前写的 table_entry.GetScanFunction(context, bind_data) 现在能编译了
-//     TableFunction table_func = table_entry.GetScanFunction(context, bind_data);
-
-//     // ===== 下面这些你原来已有的 returned_types/column_ids/projection_ids/... 构造逻辑保持即可 =====
-
-//     duckdb::unique_ptr<TableFilterSet> table_filters; // 先不下推过滤，跑通后再加
-
-//     idx_t estimated_card = 1;
-//     ExtraOperatorInfo extra_info;
-//     duckdb::vector<Value> parameters;
-//     duckdb::virtual_column_map_t virtual_columns;
-
-//     // 注意：构造 PhysicalTableScan 的第3个参数是 TableFunction（按值），建议 move
-//     auto &scan_op = Make<PhysicalTableScan>(
-//         std::move(output_types),
-//         std::move(table_func),            // <- 这里 move 掉
-//         std::move(bind_data),             // <- duckdb::unique_ptr
-//         std::move(returned_types),
-//         std::move(column_ids),
-//         std::move(projection_ids),
-//         std::move(column_names),
-//         std::move(table_filters),         // <- duckdb::unique_ptr
-//         estimated_card,
-//         std::move(extra_info),
-//         std::move(parameters),
-//         std::move(virtual_columns)
-//     );
-
-//     return scan_op;
-// }
-
-// duckdb::PhysicalOperator &
-// PgPhysicalPlanGenerator::CreatePlanSeqScan(SeqScan *scan) {
-//     using namespace duckdb;
-        
-//     EnsureDuckdbQ1TestData(); // 现在的 Q1 测试表&数据初始化
-
-//     Plan *plan_node = (Plan *)scan;
-//     Scan *scan_node = (Scan *)scan;
-
-//     // 1. 从 PG 侧拿表信息
-//     RangeTblEntry *rte = rt_fetch(scan_node->scanrelid, pstmt->rtable);
-//     if (!rte || rte->rtekind != RTE_RELATION) {
-//         ereport(ERROR,
-//                 (errmsg("CreatePlanSeqScan: only base relation supported")));
-//     }
-
-//     struct RelationData *rel = table_open(rte->relid, AccessShareLock);
-//     TupleDesc tupdesc = RelationGetDescr(rel);
-//     int natts = tupdesc->natts;
-    
-//     const char *pg_table_name = get_rel_name(rte->relid);
-//     if (!pg_table_name) {
-//         table_close(rel, AccessShareLock);
-//         ereport(ERROR, (errmsg("CreatePlanSeqScan: get_rel_name failed")));
-//     }
-//     if (strcmp(pg_table_name, "lineitem") != 0) {
-//         table_close(rel, AccessShareLock);
-//         ereport(ERROR, (errmsg("Q1-only mode: only table 'lineitem' supported, got '%s'", pg_table_name)));
-//     }
-
-//     // 2) DuckDB catalog lookup
-//     std::string schema_name = "main";
-//     std::string table_name  = "lineitem";
-
-//     auto &catalog = Catalog::GetSystemCatalog(context);
-//     auto &table_entry = catalog.GetEntry<TableCatalogEntry>(
-//         context, INVALID_CATALOG, schema_name, table_name
-//     );
-
-//     duckdb::vector<LogicalType> returned_types;
-//     duckdb::vector<string>      column_names;
-//     duckdb::vector<ColumnIndex>    column_ids;
-//     duckdb::vector<idx_t>       projection_ids;
-
-//     // attno -> 在上面数组里的 local index
-//     vector<column_t>    attno_to_local(natts + 1, DConstants::INVALID_INDEX);
-
-//     // ---------- 1) targetlist 中的 Var ----------
-//     ListCell *lc;
-//     for (lc = list_head(plan_node->targetlist);
-//          lc != NULL;
-//          lc = lnext(plan_node->targetlist, lc)) {
-
-//         TargetEntry *tle = (TargetEntry *)lfirst(lc);
-//         if (!IsA(tle->expr, Var)) {
-//             continue; // 复杂 expr 上交给上层 Result/Projection
-//         }
-//         Var *var = (Var *)tle->expr;
-
-//         auto binding = PgVarToPgScanColumn(
-//             var, rel, tupdesc,
-//             returned_types, column_names,
-//             column_ids
-//         );
-//         attno_to_local[binding.attno] = binding.local_index;
-//         // projection_ids 只在 targetlist 里 push
-//         projection_ids.push_back(binding.local_index);
-//     }
-
-//     // ---------- 2) qual 里的 Var 也要进 column_ids ----------
-//     if (plan_node->qual) {
-//         for (lc = list_head(plan_node->qual);
-//              lc != NULL;
-//              lc = lnext(plan_node->qual, lc)) {
-
-//             Expr *qual = (Expr *)lfirst(lc);
-//             if (!IsA(qual, OpExpr)) {
-//                 continue;
-//             }
-//             auto *op = (OpExpr *)qual;
-//             if (list_length(op->args) != 2) {
-//                 continue;
-//             }
-//             Expr *arg1 = (Expr *)linitial(op->args);
-//             if (!IsA(arg1, Var)) {
-//                 continue;
-//             }
-//             Var *var = (Var *)arg1;
-//             auto binding = PgVarToPgScanColumn(
-//                 var, rel, tupdesc,
-//                 returned_types, column_names,
-//                 column_ids 
-//             );
-//             attno_to_local[binding.attno] = binding.local_index;
-//         }
-//     }
-
-//     // ---------- 3) 从 qual 构造 TableFilterSet ----------对第几列（local_index）做过滤
-//     unique_ptr<TableFilterSet> table_filters;
-//     if (plan_node->qual) {
-//         auto logical_filters = make_uniq<TableFilterSet>();
-//         for (lc = list_head(plan_node->qual);
-//              lc != NULL;
-//              lc = lnext(plan_node->qual, lc)) {
-
-//             Expr *qual = (Expr *)lfirst(lc);
-//             TryBuildComparisonFilterFromQual_Q1_PG(
-//                 qual, tupdesc, attno_to_local, *logical_filters
-//             );
-//         }
-//         if (!logical_filters->filters.empty()) {
-//             table_filters = std::move(logical_filters);
-//         }
-//     }
-
-//     // ---------- 4) 输出 schema ----------
-//     // returned_types/column_names：是所有“要读的列”（包括只用于过滤、不输出的列）
-//     // duckdb::vector<LogicalType> output_types = returned_types;
-//     // duckdb::vector<string>      output_names = column_names;
-
-//     //只需要 targetlist 中的列，所以：新建 output_types / output_names
-//     std::vector<LogicalType> output_types;
-//     std::vector<std::string> output_names;
-//     output_types.reserve(returned_types.size());
-//     output_names.reserve(column_names.size());
-
-//     // 对 projection_ids 里的每一个 index：
-//     // 从 returned_types[proj_idx] 取 type， push 到 output_types；
-//     // 从 column_names[proj_idx] 取 name， push 到 output_names。
-
-//     for (auto proj_idx : projection_ids) {
-//         output_types.push_back(returned_types[proj_idx]);
-//         output_names.push_back(column_names[proj_idx]);
-//     }
-
-//     // 6) 真实 scan function + bind_data（可执行）
-//     duckdb::unique_ptr<FunctionData> bind_data;
-//     TableFunction table_func = table_entry.GetScanFunction(context, bind_data);
-
-//     // 3) 打开 Projections / Filters 的打印开关
-//     table_func.projection_pushdown = true;  //这个表函数支持只读某些列，而不是所有列
-//     table_func.filter_prune        = true;   // 只打印 projection_ids 中的列,将qual中的列保留在scan 的 returned_types/column_ids
-//     table_func.filter_pushdown     = true;//这个表函数支持把上层的 WHERE 条件下推到底层 scan，自己利用这些 filter 去做更高效的读取。
-
-
-
-//     idx_t estimated_card = (idx_t)plan_node->plan_rows;
-//     ExtraOperatorInfo extra_info;
-//     duckdb::vector<Value>   parameters;
-//     // vector<column_t> virtual_columns;
-
-//     // virtual_column_map_t 是一个别名，用它
-//     duckdb::virtual_column_map_t virtual_columns;
-
-//     auto &scan_op = Make<PhysicalTableScan>(
-//         std::move(output_types),
-//         table_func,
-//         std::move(bind_data),
-//         std::move(returned_types),
-//         std::move(column_ids),
-//         std::move(projection_ids),
-//         std::move(column_names),
-//         std::move(table_filters),
-//         estimated_card,
-//         std::move(extra_info),
-//         std::move(parameters),
-//         std::move(virtual_columns)
-//     );
-
-//     table_close(rel, AccessShareLock);
-//     return scan_op;
-
-// }
-
 static void ClientNotice(const std::string &s) {
     ereport(NOTICE, (errmsg_internal("%s", s.c_str())));
 }
@@ -2047,6 +1448,33 @@ static void CollectAndQuals(Expr *qual, std::vector<Expr*> &out) {
         }
     }
     out.push_back(qual);
+}
+
+
+// fold var-free expression to Const (e.g. date 'x' - interval '90 day')
+static Const *TryFoldToConst(Expr *e) {
+    e = StripRelabel(e);
+    if (!e) return nullptr;
+
+    if (IsA(e, Const)) {
+        return (Const *)e;
+    }
+
+    // do not fold if contains Vars
+    if (contain_var_clause((Node *)e)) {
+        return nullptr;
+    }
+
+    Node *folded = eval_const_expressions(NULL, (Node *)e);
+    if (!folded) {
+        return nullptr;
+    }
+
+    Expr *fe = StripRelabel((Expr *)folded);
+    if (fe && IsA(fe, Const)) {
+        return (Const *)fe;
+    }
+    return nullptr;
 }
 
 // 3) PG Const -> DuckDB Value (covers TPCH-style types; you can extend later)
@@ -2153,6 +1581,7 @@ static duckdb::ExpressionType ReverseCmp(duckdb::ExpressionType t) {
 //    - returns true if pushed
 //    - returns false if unsupported form
 static bool TryBuildComparisonFilterFromQual_Physical(
+    duckdb::ClientContext &dctx,
     Expr *qual,
     TupleDesc tupdesc,
     const std::unordered_map<std::string, DuckColRef> &duck_colmap,
@@ -2173,43 +1602,68 @@ static bool TryBuildComparisonFilterFromQual_Physical(
     Const *cst = nullptr;
     bool const_on_left = false;
 
-    if (IsA(a1, Var) && IsA(a2, Const)) {
+    if (IsA(a1, Var)) {
         var = (Var *)a1;
-        cst = (Const *)a2;
-    } else if (IsA(a1, Const) && IsA(a2, Var)) {
+        cst = TryFoldToConst(a2);   // 允许 date 'x' - interval '90 day'
+        const_on_left = false;
+    } else if (IsA(a2, Var)) {
         var = (Var *)a2;
-        cst = (Const *)a1;
+        cst = TryFoldToConst(a1);
         const_on_left = true;
     } else {
         return false;
     }
+    if (!var || !cst) return false;
+    if (cst->constisnull) return false;
 
     const char *opname = get_opname(opexpr->opno);
     if (!opname) return false;
 
     ExpressionType cmp;
     if (strcmp(opname, "<=") == 0) cmp = ExpressionType::COMPARE_LESSTHANOREQUALTO;
-    else if (strcmp(opname, "<") == 0) cmp = ExpressionType::COMPARE_LESSTHAN;
-    else if (strcmp(opname, "=") == 0) cmp = ExpressionType::COMPARE_EQUAL;
+    else if (strcmp(opname, "<")  == 0) cmp = ExpressionType::COMPARE_LESSTHAN;
+    else if (strcmp(opname, "=")  == 0) cmp = ExpressionType::COMPARE_EQUAL;
     else if (strcmp(opname, ">=") == 0) cmp = ExpressionType::COMPARE_GREATERTHANOREQUALTO;
-    else if (strcmp(opname, ">") == 0) cmp = ExpressionType::COMPARE_GREATERTHAN;
+    else if (strcmp(opname, ">")  == 0) cmp = ExpressionType::COMPARE_GREATERTHAN;
     else return false;
 
     if (const_on_left) cmp = ReverseCmp(cmp);
-    if (cst->constisnull) return false;
 
+    // physical column id
     std::string pg_colname;
     auto physical = PgVarToDuckPhysical(var, tupdesc, duck_colmap, pg_colname);
 
-    Value v = PgConstToDuckValue(cst);
-    auto tf = duckdb::make_uniq<ConstantFilter>(cmp, v);
+    // column logical type
+    auto it = duck_colmap.find(NormalizeIdent(pg_colname));
+    if (it == duck_colmap.end()) {
+        ereport(ERROR, (errmsg("TryBuildComparisonFilterFromQual_Physical: column '%s' not found", pg_colname.c_str())));
+    }
+    const auto &col_type = it->second.duck_type;
 
-    // IMPORTANT: you are in PHYSICAL column space now
+    // Const -> Value
+    Value v = PgConstToDuckValue(cst);
+    if (v.IsNull()) return false;
+
+    // cast RHS to column type (关键修复：避免 DuckDB 内部 assert/type mismatch)
+    try {
+        if (v.type().id() != col_type.id()) {
+            v = v.CastAs(dctx, col_type, false /*strict*/);
+        }
+    } catch (std::exception &ex) {
+        ereport(ERROR,
+            (errmsg("Filter constant cast failed: col='%s' col_type=%s const_type=%s err=%s",
+                    pg_colname.c_str(),
+                    col_type.ToString().c_str(),
+                    v.type().ToString().c_str(),
+                    ex.what())));
+    }
+
+    auto tf = make_uniq<ConstantFilter>(cmp, v);
+
+    // PushFilter 用 physical id
     table_filters.PushFilter(ColumnIndex((idx_t)physical), std::move(tf));
     return true;
 }
-
-
 
 duckdb::PhysicalOperator &
 PgPhysicalPlanGenerator::CreatePlanSeqScan(SeqScan *scan) {
@@ -2228,7 +1682,6 @@ PgPhysicalPlanGenerator::CreatePlanSeqScan(SeqScan *scan) {
     struct RelationData *rel = table_open(rte->relid, AccessShareLock);
     TupleDesc tupdesc = RelationGetDescr(rel);
 
-    // 仅支持 lineitem（Q1）
     const char *pg_table_name = get_rel_name(rte->relid);
     if (!pg_table_name) {
         table_close(rel, AccessShareLock);
@@ -2239,139 +1692,99 @@ PgPhysicalPlanGenerator::CreatePlanSeqScan(SeqScan *scan) {
         ereport(ERROR, (errmsg("Q1-only mode: only table 'lineitem' supported, got '%s'", pg_table_name)));
     }
 
-    // 打印 PG SeqScan targetlist
-    {
-        ClientNotice("---- PG SeqScan targetlist ----");
-        int i = 0;
-        for (ListCell *lc = list_head(plan_node->targetlist); lc != NULL; lc = lnext(plan_node->targetlist, lc), i++) {
-            TargetEntry *tle = (TargetEntry *)lfirst(lc);
-            if (IsA(tle->expr, Var)) {
-                Var *v = (Var *)tle->expr;
-                ClientNotice("target[" + std::to_string(i) + "]: attno=" + std::to_string((int)v->varattno) +
-                             " name=" + AttnoToName(tupdesc, v->varattno) +
-                             " resjunk=" + std::to_string((int)tle->resjunk));
-            } else {
-                ClientNotice("target[" + std::to_string(i) + "]: non-Var nodeTag=" + std::to_string((int)nodeTag(tle->expr)) +
-                             " resjunk=" + std::to_string((int)tle->resjunk));
-            }
-        }
-    }
-
     // DuckDB catalog: main.lineitem
     std::string schema_name = "main";
     std::string table_name  = "lineitem";
     auto &catalog = Catalog::GetSystemCatalog(context);
-    auto &table_entry = catalog.GetEntry<TableCatalogEntry>(
-        context, INVALID_CATALOG, schema_name, table_name
-    );
+    auto &table_entry = catalog.GetEntry<TableCatalogEntry>(context, INVALID_CATALOG, schema_name, table_name);
 
-    // name->(physical,type)
     auto duck_colmap = BuildDuckColumnMap(table_entry);
 
-    // 物理列空间（长度=全表物理列数）
+    // ---- physical space vectors (关键：彻底避免 OOB) ----
     duckdb::vector<std::string> physical_names = BuildDuckPhysicalNameVector(table_entry);
     duckdb::vector<duckdb::LogicalType> physical_types = BuildDuckPhysicalTypeVector(table_entry);
 
-    ClientNotice("DuckDB physical_names.size=" + std::to_string((int)physical_names.size()) +
-                 " physical_names[8]=" + (physical_names.size() > 8 ? physical_names[8] : std::string("<OOB>")));
-
-    // returned_types 直接用“物理列 types”（关键修复：避免 physical id 去索引 size=6）
-    duckdb::vector<LogicalType> returned_types = physical_types; // copy
-
-    // column_ids 构建为“物理列全量 identity”：column_ids[i] == i
-    duckdb::vector<ColumnIndex> column_ids;
+    duckdb::vector<duckdb::LogicalType> returned_types = physical_types; // physical
+    duckdb::vector<duckdb::ColumnIndex> column_ids;                      // physical identity
     column_ids.reserve(physical_names.size());
-    for (duckdb::idx_t i = 0; i < physical_names.size(); i++) {
+    for (idx_t i = 0; i < physical_names.size(); i++) {
         column_ids.push_back(ColumnIndex(i));
     }
 
-    // output projection ids：这里直接用 physical id（因为 local==physical）
+    // output projection ids in physical ids order (match PG targetlist order)
     duckdb::vector<idx_t> output_projection_ids;
     std::vector<bool> seen_phys(physical_names.size(), false);
 
-    // 从 targetlist 收集输出列（只收集 Var 且 resjunk=false）
     for (ListCell *lc = list_head(plan_node->targetlist); lc != NULL; lc = lnext(plan_node->targetlist, lc)) {
         TargetEntry *tle = (TargetEntry *)lfirst(lc);
         if (tle->resjunk) {
-            continue;
+            continue; // 保持你原来的行为：最终输出不带 resjunk
         }
         if (!IsA(tle->expr, Var)) {
-            // Q1 的 SeqScan targetlist 理论上全是 Var；如果你还没支持更复杂下推，就直接跳过或报错
-            continue;
+            continue; // Q1-only 简化
         }
         Var *var = (Var *)tle->expr;
 
         std::string pg_colname;
         duckdb::column_t phys = PgVarToDuckPhysical(var, tupdesc, duck_colmap, pg_colname);
 
-        if ((duckdb::idx_t)phys >= physical_names.size()) {
+        if ((idx_t)phys >= physical_names.size()) {
             ereport(ERROR, (errmsg("BUG: physical id %d out of range physical_names.size=%d",
                                    (int)phys, (int)physical_names.size())));
         }
 
-        if (!seen_phys[(duckdb::idx_t)phys]) {
-            seen_phys[(duckdb::idx_t)phys] = true;
+        if (!seen_phys[(idx_t)phys]) {
+            seen_phys[(idx_t)phys] = true;
             output_projection_ids.push_back((idx_t)phys);
         }
     }
 
-    // 没有输出列就默认全列（一般不会发生在 Q1）
     if (output_projection_ids.empty()) {
+        // 极端兜底：全列
         output_projection_ids.reserve(physical_names.size());
-        for (duckdb::idx_t i = 0; i < physical_names.size(); i++) {
+        for (idx_t i = 0; i < physical_names.size(); i++) {
             output_projection_ids.push_back(i);
         }
     }
 
-    // 输出 types：按 output_projection_ids（physical）取 physical_types
-    duckdb::vector<LogicalType> output_types;
+    // output types = physical_types[projection_id]
+    duckdb::vector<duckdb::LogicalType> output_types;
     output_types.reserve(output_projection_ids.size());
     for (auto pid : output_projection_ids) {
         if (pid >= physical_types.size()) {
-            ereport(ERROR, (errmsg("BUG: projection physical id %llu out of range physical_types.size=%llu",
+            ereport(ERROR, (errmsg("BUG: projection id %llu out of range physical_types.size=%llu",
                                    (unsigned long long)pid, (unsigned long long)physical_types.size())));
         }
         output_types.push_back(physical_types[pid]);
     }
 
-ClientNotice("---- PG SeqScan qual ----");
-ClientNotice("plan_node->qual length = " + std::to_string(list_length(plan_node->qual)));
-
-
-    // -------------------------
-    // WHERE pushdown (plan_node->qual)
-    // -------------------------
+    // ---- WHERE pushdown (physical) ----
     unique_ptr<TableFilterSet> table_filters;
     if (plan_node->qual) {
         auto logical_filters = make_uniq<TableFilterSet>();
 
+        // flatten AND
         std::vector<Expr*> clauses;
         for (ListCell *lc = list_head(plan_node->qual); lc != NULL; lc = lnext(plan_node->qual, lc)) {
             CollectAndQuals((Expr *)lfirst(lc), clauses);
         }
-ClientNotice("flattened clauses = " + std::to_string((int)clauses.size()));
-        int pushed = 0;
-        int total  = 0;
+
+        int pushed = 0, total = 0;
         for (auto *cl : clauses) {
             total++;
-            if (TryBuildComparisonFilterFromQual_Physical(cl, tupdesc, duck_colmap, *logical_filters)) {
+            if (TryBuildComparisonFilterFromQual_Physical(context, cl, tupdesc, duck_colmap, *logical_filters)) {
                 pushed++;
             } else {
-                // IMPORTANT:
-                // 为了语义正确：你现在还没有生成 DuckDB 侧的 PhysicalFilter 节点来执行未下推条件
-                // 所以遇到不支持的 qual 必须报错，否则结果会错。
                 ereport(ERROR,
                         (errmsg("CreatePlanSeqScan: unsupported WHERE qual for pushdown (nodeTag=%d). "
                                 "Implement remaining qual as DuckDB PhysicalFilter or extend pushdown.",
                                 (int)nodeTag(cl))));
             }
         }
-        ClientNotice("table_filters.size = " + std::to_string((int)logical_filters->filters.size()));
-    ClientNotice("pushed filters = " + std::to_string(pushed));
 
         if (!logical_filters->filters.empty()) {
             table_filters = std::move(logical_filters);
-            ClientNotice("SeqScan pushdown filters: " + std::to_string(pushed) + "/" + std::to_string(total));
+            ereport(NOTICE, (errmsg_internal("SeqScan pushdown filters: %d/%d", pushed, total)));
         }
     }
 
@@ -2387,15 +1800,15 @@ ClientNotice("flattened clauses = " + std::to_string((int)clauses.size()));
     duckdb::vector<Value> parameters;
     duckdb::virtual_column_map_t virtual_columns;
 
-    // 关键：names/returned_types/column_ids 全部在“物理列空间”，projection_ids 也用 physical id
+    // ---- PhysicalTableScan: ALL physical-space vectors ----
     auto &scan_op = Make<PhysicalTableScan>(
         std::move(output_types),
         table_func,
         std::move(bind_data),
-        std::move(returned_types),          // 物理 types（size=16）
-        std::move(column_ids),              // identity（size=16）
-        std::move(output_projection_ids),   // physical ids（例如 8,9,4,5,6,7）
-        std::move(physical_names),          // 物理 names（size=16）
+        std::move(returned_types),          // physical_types (N)
+        std::move(column_ids),              // identity 0..N-1
+        std::move(output_projection_ids),   // physical ids (e.g. 8,9,4,5,6,7)
+        std::move(physical_names),          // physical names (N)
         std::move(table_filters),
         estimated_card,
         std::move(extra_info),
@@ -2405,8 +1818,8 @@ ClientNotice("flattened clauses = " + std::to_string((int)clauses.size()));
 
     table_close(rel, AccessShareLock);
 
-    // 现在这里 ToString 不应该再炸
-    ClientNotice("---- DuckDB scan_op.ToString() right after construction ----\n" + scan_op.ToString());
+    // 现在 ToString 也应该稳定
+    ereport(NOTICE, (errmsg_internal("---- DuckDB scan_op.ToString ----\n%s", scan_op.ToString().c_str())));
     return scan_op;
 }
 
@@ -2468,85 +1881,6 @@ PgPhysicalPlanGenerator::CreatePlanResult(Result *res) {
 
     return proj;
 }
-
-
-// 收集是否有重复表达式
-// static void
-// CountExpressions(Expression &expr, CSEReplaceState &state) {
-// 	// we only consider expressions with children for CSE elimination
-// 	switch (expr.GetExpressionClass()) {
-// 	case ExpressionClass::BOUND_COLUMN_REF:
-// 	case ExpressionClass::BOUND_CONSTANT:
-// 	case ExpressionClass::BOUND_PARAMETER:
-// 		return;
-// 	default:
-// 		break;
-// 	}
-// 	if (expr.GetExpressionClass() != ExpressionClass::BOUND_AGGREGATE && !expr.IsVolatile()) {
-// 		// we can't move aggregates to a projection, so we only consider the children of the aggregate
-// 		auto node = state.expression_count.find(expr);
-// 		if (node == state.expression_count.end())
-// 			// first time we encounter this expression, insert this node with [count = 1]
-// 			// but only if it is not an interior argument of a short circuit sensitive expression.
-// 				state.expression_count[expr] = CSENode();
-// 		else {
-// 			// we encountered this expression before, increment the occurrence count
-// 			node->second.count++;
-//             state.perform_replacement = true;
-// 		}
-// 	}
-
-// 	// recursively count the children
-// 	ExpressionIterator::EnumerateChildren(expr, [&](Expression &child) { CountExpressions(child, state); });
-// }
-
-// static void
-// PerformCSEReplacement(unique_ptr<Expression> &expr_ptr, CSEReplaceState &state) {
-// 	Expression &expr = *expr_ptr;
-// 	// 对不同类型的表达式做替换处理，目标是将重复表达式替换为投影中计算的列引用
-// 	if (expr.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
-// 		auto &bound_column_ref = expr.Cast<BoundColumnRefExpression>();
-// 		// bound column ref, check if this one has already been recorded in the expression list
-// 		auto column_entry = state.column_map.find(bound_column_ref.binding);
-// 		if (column_entry == state.column_map.end()) {
-// 			// not there yet: push the expression
-// 			idx_t new_column_index = state.expressions.size();
-// 			state.column_map[bound_column_ref.binding] = new_column_index;
-// 			state.expressions.push_back(make_uniq<BoundColumnRefExpression>(
-// 			    bound_column_ref.GetAlias(), bound_column_ref.return_type, bound_column_ref.binding));
-// 			bound_column_ref.binding = ColumnBinding(0, new_column_index);
-// 		} else {
-// 			// else: just update the column binding!
-// 			bound_column_ref.binding = ColumnBinding(0, column_entry->second);
-// 		}
-// 		return;
-// 	}
-
-// 	// check if this child is eligible for CSE elimination
-// 	if (state.expression_count.find(expr) != state.expression_count.end()) {
-// 		auto &node = state.expression_count[expr];
-// 		if (node.count > 1) {
-// 			// this expression occurs more than once! push it into the projection
-// 			// check if it has already been pushed into the projection
-// 			auto alias = expr.GetAlias();
-// 			auto type = expr.return_type;
-// 			if (!node.column_index.IsValid()) {
-// 				// has not been pushed yet: push it
-// 				node.column_index = state.expressions.size();
-// 				state.expressions.push_back(std::move(expr_ptr));
-// 			} else {
-// 				state.cached_expressions.push_back(std::move(expr_ptr));
-// 			}
-// 			// replace the original expression with a bound column ref
-// 			expr_ptr = make_uniq<BoundReferenceExpression>(type, node.column_index.GetIndex());
-// 			return;
-// 		}
-// 	}
-// 	// this expression only occurs once, we can't perform CSE elimination
-// 	// look into the children to see if we can replace them
-// 	ExpressionIterator::EnumerateChildren(expr,
-// 	                                      [&](unique_ptr<Expression> &child) { PerformCSEReplacement(child, state); });
-// }
 
 static void
 CountExpressions(Expression &expr, CSEReplaceState &state) {
@@ -3767,22 +3101,17 @@ extern "C" const char *dbg_expr_detail(duckdb::Expression *expr) {
     return last.c_str();
 }
 
-static vector<string> getOutputColumnNames(PhysicalPlan &plan) {
-    auto &root_op = plan.Root();
-    if (root_op.type == PhysicalOperatorType::TABLE_SCAN)
-        return root_op.Cast<PhysicalTableScan>().names;
-    if (root_op.type == PhysicalOperatorType::PROJECTION) {
-        auto &proj = root_op.Cast<PhysicalProjection>();
-        vector<string> names;
-        for (auto &expr : proj.select_list)
-            names.push_back(expr->GetName());
-        return names;
-    }
-
+static vector<string> getOutputColumnNames(PlannedStmt *pstmt) {
     vector<string> names;
-    auto &types = root_op.GetTypes();
-    for (idx_t i = 0; i < types.size(); i++)
-        names.push_back("col" + std::to_string(i));
+    ListCell *lc;
+    Plan *plan_node = pstmt->planTree;
+    foreach(lc, plan_node->targetlist) {
+        TargetEntry *tle = (TargetEntry *) lfirst(lc);
+        if (!tle || tle->resjunk)
+            continue;
+
+        names.push_back(tle->resname);
+    }
 
     return names;
 }
@@ -3813,7 +3142,7 @@ pg_run_duckdb_physical_plan(void *stmt_ptr, void **out_plan_ptr, char **error_ms
         shared_ptr<PreparedStatementData> prepared = make_shared_ptr<PreparedStatementData>(StatementType::SELECT_STATEMENT);
         auto prep = make_shared_ptr<StatementProperties>();
         prepared->properties = *prep;
-        prepared->names = getOutputColumnNames(*plan);
+        prepared->names = getOutputColumnNames(pstmt);
 
         auto &root_op = plan->Root();
         prepared->types = root_op.types;
