@@ -20,6 +20,7 @@
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/planner/bound_statement.hpp"
+#include "duckdb/planner/expression/bound_reference_expression.hpp"
 
 #include <ctime>
 
@@ -168,7 +169,7 @@ unique_ptr<Expression> map_pg_expr(void *vnode) {
             if ((size_t)colidx < g_current_types.size()) {
                 ltype = g_current_types[colidx];
             }       
-            return make_uniq<BoundColumnRefExpression>(alias, ltype, ColumnBinding(0, colidx));
+            return make_uniq<BoundReferenceExpression>(alias, ltype, colidx);
         }
 
         case T_Const: {
