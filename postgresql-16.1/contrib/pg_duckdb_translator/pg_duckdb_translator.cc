@@ -2291,10 +2291,7 @@ PgPhysicalPlanGenerator::CreatePlanAgg(Agg *agg) {
                             fn_name_c)));
         }
 
-        if (!arg_types.empty() &&
-            (arg_types[0].id() == LogicalTypeId::DOUBLE ||
-            arg_types[0].id() == LogicalTypeId::DECIMAL))
-            return_type = agg_func.return_type.DeepCopy();
+        return_type = agg_func.return_type.DeepCopy();
         auto bound_aggr = duckdb::make_uniq<duckdb::BoundAggregateExpression>(
             std::move(agg_func),
             std::move(arg_exprs),
@@ -3136,7 +3133,7 @@ static vector<string> getOutputColumnNames(PlannedStmt *pstmt) {
 extern "C" bool
 pg_run_duckdb_physical_plan(void *stmt_ptr, void **out_plan_ptr, char **error_msg) {
     // 1. 建一个“长期存活”的 DuckDB 实例和连接（避免 plan 指向已销毁 allocator）
-    static duckdb::DuckDB db("/home/yzx/duckdb/postgresql-16.1/contrib/duckdb-1.4.2/build/release/t.db");
+    static duckdb::DuckDB db("/home/yzx/duckdb/postgresql-16.1/contrib/duckdb-1.4.2/build/debug/t.db");
     static duckdb::Connection conn(db);
 
     try {
