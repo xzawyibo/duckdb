@@ -111,6 +111,7 @@
 #include <ctime>
 
 #include "pg_duckdb_mapper.h"
+#include "pgduckdb/scan/postgres_scan.hpp"
 
 // for exectue
 #include "duckdb/main/pending_query_result.hpp"
@@ -147,7 +148,7 @@
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/filter/constant_filter.hpp"
 #include "duckdb/common/types/date.hpp"
-
+#include "duckdb/common/types/decimal.hpp"
 
 extern "C" {
 #include "postgres.h"
@@ -167,8 +168,7 @@ extern "C" {
 #include "optimizer/tlist.h"      // get_tle_by_resno
 #include "nodes/nodeFuncs.h"
 #include "parser/parsetree.h"
-#include "optimizer/optimizer.h"
-#include "optimizer/clauses.h" 
+#include "optimizer/cost.h"
 }
 
 using duckdb::PhysicalTableScan; 
@@ -196,7 +196,7 @@ static duckdb::LogicalType PgTypeOidToDuckType(Oid typid, int32 typmod) {
 	case INT8OID: return LogicalType::BIGINT;
 	case FLOAT4OID: return LogicalType::FLOAT;
 	case FLOAT8OID: return LogicalType::DOUBLE;
-	case NUMERICOID: return LogicalType::DOUBLE; // reference choice
+	case NUMERICOID:  return LogicalType::DECIMAL(15, 2);
 	case TEXTOID:
 	case VARCHAROID:
 	case BPCHAROID: return LogicalType::VARCHAR;
@@ -206,6 +206,7 @@ static duckdb::LogicalType PgTypeOidToDuckType(Oid typid, int32 typmod) {
 		throw duckdb::InternalException("PgTypeOidToDuckType: unsupported type oid " + std::to_string((uint32)typid));
 	}
 }
+
 
 
 // ---------------- helper: normalize identifier ----------------
@@ -1332,7 +1333,6 @@ std::string PgPhysicalPlanGenerator::ChooseAliasFromPG(Expr *expr, TargetEntry *
 }
 
 
-
 // --------------------------------------------
 // 1) DuckDB runtime: in-memory DB + Connection
 // --------------------------------------------
@@ -1415,6 +1415,7 @@ static void EnsureDuckdbQ1TestData() {
     rt.q1_ready = true;
 }
 
+
 static void ClientNotice(const std::string &s) {
     ereport(NOTICE, (errmsg_internal("%s", s.c_str())));
 }
@@ -1448,33 +1449,6 @@ static void CollectAndQuals(Expr *qual, std::vector<Expr*> &out) {
         }
     }
     out.push_back(qual);
-}
-
-
-// fold var-free expression to Const (e.g. date 'x' - interval '90 day')
-static Const *TryFoldToConst(Expr *e) {
-    e = StripRelabel(e);
-    if (!e) return nullptr;
-
-    if (IsA(e, Const)) {
-        return (Const *)e;
-    }
-
-    // do not fold if contains Vars
-    if (contain_var_clause((Node *)e)) {
-        return nullptr;
-    }
-
-    Node *folded = eval_const_expressions(NULL, (Node *)e);
-    if (!folded) {
-        return nullptr;
-    }
-
-    Expr *fe = StripRelabel((Expr *)folded);
-    if (fe && IsA(fe, Const)) {
-        return (Const *)fe;
-    }
-    return nullptr;
 }
 
 // 3) PG Const -> DuckDB Value (covers TPCH-style types; you can extend later)
@@ -1581,7 +1555,6 @@ static duckdb::ExpressionType ReverseCmp(duckdb::ExpressionType t) {
 //    - returns true if pushed
 //    - returns false if unsupported form
 static bool TryBuildComparisonFilterFromQual_Physical(
-    duckdb::ClientContext &dctx,
     Expr *qual,
     TupleDesc tupdesc,
     const std::unordered_map<std::string, DuckColRef> &duck_colmap,
@@ -1602,68 +1575,43 @@ static bool TryBuildComparisonFilterFromQual_Physical(
     Const *cst = nullptr;
     bool const_on_left = false;
 
-    if (IsA(a1, Var)) {
+    if (IsA(a1, Var) && IsA(a2, Const)) {
         var = (Var *)a1;
-        cst = TryFoldToConst(a2);   // 允许 date 'x' - interval '90 day'
-        const_on_left = false;
-    } else if (IsA(a2, Var)) {
+        cst = (Const *)a2;
+    } else if (IsA(a1, Const) && IsA(a2, Var)) {
         var = (Var *)a2;
-        cst = TryFoldToConst(a1);
+        cst = (Const *)a1;
         const_on_left = true;
     } else {
         return false;
     }
-    if (!var || !cst) return false;
-    if (cst->constisnull) return false;
 
     const char *opname = get_opname(opexpr->opno);
     if (!opname) return false;
 
     ExpressionType cmp;
     if (strcmp(opname, "<=") == 0) cmp = ExpressionType::COMPARE_LESSTHANOREQUALTO;
-    else if (strcmp(opname, "<")  == 0) cmp = ExpressionType::COMPARE_LESSTHAN;
-    else if (strcmp(opname, "=")  == 0) cmp = ExpressionType::COMPARE_EQUAL;
+    else if (strcmp(opname, "<") == 0) cmp = ExpressionType::COMPARE_LESSTHAN;
+    else if (strcmp(opname, "=") == 0) cmp = ExpressionType::COMPARE_EQUAL;
     else if (strcmp(opname, ">=") == 0) cmp = ExpressionType::COMPARE_GREATERTHANOREQUALTO;
-    else if (strcmp(opname, ">")  == 0) cmp = ExpressionType::COMPARE_GREATERTHAN;
+    else if (strcmp(opname, ">") == 0) cmp = ExpressionType::COMPARE_GREATERTHAN;
     else return false;
 
     if (const_on_left) cmp = ReverseCmp(cmp);
+    if (cst->constisnull) return false;
 
-    // physical column id
     std::string pg_colname;
     auto physical = PgVarToDuckPhysical(var, tupdesc, duck_colmap, pg_colname);
 
-    // column logical type
-    auto it = duck_colmap.find(NormalizeIdent(pg_colname));
-    if (it == duck_colmap.end()) {
-        ereport(ERROR, (errmsg("TryBuildComparisonFilterFromQual_Physical: column '%s' not found", pg_colname.c_str())));
-    }
-    const auto &col_type = it->second.duck_type;
-
-    // Const -> Value
     Value v = PgConstToDuckValue(cst);
-    if (v.IsNull()) return false;
+    auto tf = duckdb::make_uniq<ConstantFilter>(cmp, v);
 
-    // cast RHS to column type (关键修复：避免 DuckDB 内部 assert/type mismatch)
-    try {
-        if (v.type().id() != col_type.id()) {
-            v = v.CastAs(dctx, col_type, false /*strict*/);
-        }
-    } catch (std::exception &ex) {
-        ereport(ERROR,
-            (errmsg("Filter constant cast failed: col='%s' col_type=%s const_type=%s err=%s",
-                    pg_colname.c_str(),
-                    col_type.ToString().c_str(),
-                    v.type().ToString().c_str(),
-                    ex.what())));
-    }
-
-    auto tf = make_uniq<ConstantFilter>(cmp, v);
-
-    // PushFilter 用 physical id
+    // IMPORTANT: you are in PHYSICAL column space now
     table_filters.PushFilter(ColumnIndex((idx_t)physical), std::move(tf));
     return true;
 }
+
+
 
 duckdb::PhysicalOperator &
 PgPhysicalPlanGenerator::CreatePlanSeqScan(SeqScan *scan) {
@@ -1682,6 +1630,7 @@ PgPhysicalPlanGenerator::CreatePlanSeqScan(SeqScan *scan) {
     struct RelationData *rel = table_open(rte->relid, AccessShareLock);
     TupleDesc tupdesc = RelationGetDescr(rel);
 
+    // 仅支持 lineitem（Q1）
     const char *pg_table_name = get_rel_name(rte->relid);
     if (!pg_table_name) {
         table_close(rel, AccessShareLock);
@@ -1692,123 +1641,171 @@ PgPhysicalPlanGenerator::CreatePlanSeqScan(SeqScan *scan) {
         ereport(ERROR, (errmsg("Q1-only mode: only table 'lineitem' supported, got '%s'", pg_table_name)));
     }
 
+    // 打印 PG SeqScan targetlist
+    {
+        ClientNotice("---- PG SeqScan targetlist ----");
+        int i = 0;
+        for (ListCell *lc = list_head(plan_node->targetlist); lc != NULL; lc = lnext(plan_node->targetlist, lc), i++) {
+            TargetEntry *tle = (TargetEntry *)lfirst(lc);
+            if (IsA(tle->expr, Var)) {
+                Var *v = (Var *)tle->expr;
+                ClientNotice("target[" + std::to_string(i) + "]: attno=" + std::to_string((int)v->varattno) +
+                             " name=" + AttnoToName(tupdesc, v->varattno) +
+                             " resjunk=" + std::to_string((int)tle->resjunk));
+            } else {
+                ClientNotice("target[" + std::to_string(i) + "]: non-Var nodeTag=" + std::to_string((int)nodeTag(tle->expr)) +
+                             " resjunk=" + std::to_string((int)tle->resjunk));
+            }
+        }
+    }
+
     // DuckDB catalog: main.lineitem
     std::string schema_name = "main";
     std::string table_name  = "lineitem";
     auto &catalog = Catalog::GetSystemCatalog(context);
-    auto &table_entry = catalog.GetEntry<TableCatalogEntry>(context, INVALID_CATALOG, schema_name, table_name);
+    auto &table_entry = catalog.GetEntry<TableCatalogEntry>(
+        context, INVALID_CATALOG, schema_name, table_name
+    );
 
+    // name->(physical,type)
     auto duck_colmap = BuildDuckColumnMap(table_entry);
 
-    // ---- physical space vectors (关键：彻底避免 OOB) ----
+    // 物理列空间（长度=全表物理列数）
     duckdb::vector<std::string> physical_names = BuildDuckPhysicalNameVector(table_entry);
     duckdb::vector<duckdb::LogicalType> physical_types = BuildDuckPhysicalTypeVector(table_entry);
 
-    duckdb::vector<duckdb::LogicalType> returned_types = physical_types; // physical
-    duckdb::vector<duckdb::ColumnIndex> column_ids;                      // physical identity
+    ClientNotice("DuckDB physical_names.size=" + std::to_string((int)physical_names.size()) +
+                 " physical_names[8]=" + (physical_names.size() > 8 ? physical_names[8] : std::string("<OOB>")));
+
+    // returned_types 直接用“物理列 types”（关键修复：避免 physical id 去索引 size=6）
+    duckdb::vector<LogicalType> returned_types = physical_types; // copy
+
+    // column_ids 构建为“物理列全量 identity”：column_ids[i] == i
+    duckdb::vector<ColumnIndex> column_ids;
     column_ids.reserve(physical_names.size());
-    for (idx_t i = 0; i < physical_names.size(); i++) {
+    for (duckdb::idx_t i = 0; i < physical_names.size(); i++) {
         column_ids.push_back(ColumnIndex(i));
     }
 
-    // output projection ids in physical ids order (match PG targetlist order)
+    // output projection ids：这里直接用 physical id（因为 local==physical）
     duckdb::vector<idx_t> output_projection_ids;
     std::vector<bool> seen_phys(physical_names.size(), false);
 
+    // 从 targetlist 收集输出列（只收集 Var 且 resjunk=false）
     for (ListCell *lc = list_head(plan_node->targetlist); lc != NULL; lc = lnext(plan_node->targetlist, lc)) {
         TargetEntry *tle = (TargetEntry *)lfirst(lc);
         if (tle->resjunk) {
-            continue; // 保持你原来的行为：最终输出不带 resjunk
+            continue;
         }
         if (!IsA(tle->expr, Var)) {
-            continue; // Q1-only 简化
+            // Q1 的 SeqScan targetlist 理论上全是 Var；如果你还没支持更复杂下推，就直接跳过或报错
+            continue;
         }
         Var *var = (Var *)tle->expr;
 
         std::string pg_colname;
         duckdb::column_t phys = PgVarToDuckPhysical(var, tupdesc, duck_colmap, pg_colname);
 
-        if ((idx_t)phys >= physical_names.size()) {
+        if ((duckdb::idx_t)phys >= physical_names.size()) {
             ereport(ERROR, (errmsg("BUG: physical id %d out of range physical_names.size=%d",
                                    (int)phys, (int)physical_names.size())));
         }
 
-        if (!seen_phys[(idx_t)phys]) {
-            seen_phys[(idx_t)phys] = true;
+        if (!seen_phys[(duckdb::idx_t)phys]) {
+            seen_phys[(duckdb::idx_t)phys] = true;
             output_projection_ids.push_back((idx_t)phys);
         }
     }
 
+    // 没有输出列就默认全列（一般不会发生在 Q1）
     if (output_projection_ids.empty()) {
-        // 极端兜底：全列
         output_projection_ids.reserve(physical_names.size());
-        for (idx_t i = 0; i < physical_names.size(); i++) {
+        for (duckdb::idx_t i = 0; i < physical_names.size(); i++) {
             output_projection_ids.push_back(i);
         }
     }
 
-    // output types = physical_types[projection_id]
-    duckdb::vector<duckdb::LogicalType> output_types;
+    // 输出 types：按 output_projection_ids（physical）取 physical_types
+    duckdb::vector<LogicalType> output_types;
     output_types.reserve(output_projection_ids.size());
     for (auto pid : output_projection_ids) {
         if (pid >= physical_types.size()) {
-            ereport(ERROR, (errmsg("BUG: projection id %llu out of range physical_types.size=%llu",
+            ereport(ERROR, (errmsg("BUG: projection physical id %llu out of range physical_types.size=%llu",
                                    (unsigned long long)pid, (unsigned long long)physical_types.size())));
         }
         output_types.push_back(physical_types[pid]);
     }
 
-    // ---- WHERE pushdown (physical) ----
+ClientNotice("---- PG SeqScan qual ----");
+ClientNotice("plan_node->qual length = " + std::to_string(list_length(plan_node->qual)));
+
+
+    // -------------------------
+    // WHERE pushdown (plan_node->qual)
+    // -------------------------
     unique_ptr<TableFilterSet> table_filters;
     if (plan_node->qual) {
         auto logical_filters = make_uniq<TableFilterSet>();
 
-        // flatten AND
         std::vector<Expr*> clauses;
         for (ListCell *lc = list_head(plan_node->qual); lc != NULL; lc = lnext(plan_node->qual, lc)) {
             CollectAndQuals((Expr *)lfirst(lc), clauses);
         }
-
-        int pushed = 0, total = 0;
+ClientNotice("flattened clauses = " + std::to_string((int)clauses.size()));
+        int pushed = 0;
+        int total  = 0;
         for (auto *cl : clauses) {
             total++;
-            if (TryBuildComparisonFilterFromQual_Physical(context, cl, tupdesc, duck_colmap, *logical_filters)) {
+            if (TryBuildComparisonFilterFromQual_Physical(cl, tupdesc, duck_colmap, *logical_filters)) {
                 pushed++;
             } else {
+                // IMPORTANT:
+                // 为了语义正确：你现在还没有生成 DuckDB 侧的 PhysicalFilter 节点来执行未下推条件
+                // 所以遇到不支持的 qual 必须报错，否则结果会错。
                 ereport(ERROR,
                         (errmsg("CreatePlanSeqScan: unsupported WHERE qual for pushdown (nodeTag=%d). "
                                 "Implement remaining qual as DuckDB PhysicalFilter or extend pushdown.",
                                 (int)nodeTag(cl))));
             }
         }
+        ClientNotice("table_filters.size = " + std::to_string((int)logical_filters->filters.size()));
+    ClientNotice("pushed filters = " + std::to_string(pushed));
 
         if (!logical_filters->filters.empty()) {
             table_filters = std::move(logical_filters);
-            ereport(NOTICE, (errmsg_internal("SeqScan pushdown filters: %d/%d", pushed, total)));
+            ClientNotice("SeqScan pushdown filters: " + std::to_string(pushed) + "/" + std::to_string(total));
         }
     }
-
-    // scan function
     duckdb::unique_ptr<FunctionData> bind_data;
-    TableFunction table_func = table_entry.GetScanFunction(context, bind_data);
-    table_func.projection_pushdown = true;
-    table_func.filter_pushdown     = true;
-    table_func.filter_prune        = true;
+    TableFunction table_func;
+    // scan function
+    if (enable_hashjoin)
+    {
+        table_func = table_entry.GetScanFunction(context, bind_data);
+        table_func.projection_pushdown = true;
+        table_func.filter_pushdown     = true;
+        table_func.filter_prune        = true;
+    }
+    else
+    {
+       bind_data = duckdb::make_uniq<pgduckdb::PostgresScanFunctionData>(rel, scan_node->plan.plan_rows, nullptr);
+       table_func = pgduckdb::PostgresScanTableFunction();
+    }
 
     idx_t estimated_card = (idx_t)plan_node->plan_rows;
     ExtraOperatorInfo extra_info;
     duckdb::vector<Value> parameters;
     duckdb::virtual_column_map_t virtual_columns;
 
-    // ---- PhysicalTableScan: ALL physical-space vectors ----
+    // 关键：names/returned_types/column_ids 全部在“物理列空间”，projection_ids 也用 physical id
     auto &scan_op = Make<PhysicalTableScan>(
         std::move(output_types),
         table_func,
         std::move(bind_data),
-        std::move(returned_types),          // physical_types (N)
-        std::move(column_ids),              // identity 0..N-1
-        std::move(output_projection_ids),   // physical ids (e.g. 8,9,4,5,6,7)
-        std::move(physical_names),          // physical names (N)
+        std::move(returned_types),          // 物理 types（size=16）
+        std::move(column_ids),              // identity（size=16）
+        std::move(output_projection_ids),   // physical ids（例如 8,9,4,5,6,7）
+        std::move(physical_names),          // 物理 names（size=16）
         std::move(table_filters),
         estimated_card,
         std::move(extra_info),
@@ -1818,8 +1815,8 @@ PgPhysicalPlanGenerator::CreatePlanSeqScan(SeqScan *scan) {
 
     table_close(rel, AccessShareLock);
 
-    // 现在 ToString 也应该稳定
-    ereport(NOTICE, (errmsg_internal("---- DuckDB scan_op.ToString ----\n%s", scan_op.ToString().c_str())));
+    // 现在这里 ToString 不应该再炸
+    ClientNotice("---- DuckDB scan_op.ToString() right after construction ----\n" + scan_op.ToString());
     return scan_op;
 }
 
@@ -2193,12 +2190,18 @@ PgPhysicalPlanGenerator::CreatePlanAgg(Agg *agg) {
     // 2.3 aggregates：把 targetlist 里的 Aggref 转成 BoundAggregateExpression
     duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> aggregates;
 
+    idx_t temp_resno = 0;
     for (ListCell *lc3 = list_head(plan_node->targetlist);
          lc3 != nullptr;
          lc3 = lnext(plan_node->targetlist, lc3)) {
 
         auto *tle = (TargetEntry *) lfirst(lc3);
-        if (!tle || !IsA(tle->expr, Aggref)) {
+        if (!tle || tle->resjunk)
+            continue;
+
+
+        if (!IsA(tle->expr, Aggref)) {
+            ++temp_resno;
             continue; // 非聚合列：group key 或普通表达式
         }
 
@@ -2278,7 +2281,20 @@ PgPhysicalPlanGenerator::CreatePlanAgg(Agg *agg) {
         duckdb::AggregateType aggr_type =
             is_distinct ? duckdb::AggregateType::DISTINCT
                         : duckdb::AggregateType::NON_DISTINCT;
+        // DECIMAL double、BIGNUM情况下未绑定
+        if (!agg_func.combine)
+            agg_func.bind(context, agg_func, arg_exprs);
 
+        if (!agg_func.combine) {
+            ereport(ERROR,
+                    (errmsg("CreatePlanAgg: cannot find aggregate function implementation for %s",
+                            fn_name_c)));
+        }
+
+        if (!arg_types.empty() &&
+            (arg_types[0].id() == LogicalTypeId::DOUBLE ||
+            arg_types[0].id() == LogicalTypeId::DECIMAL))
+            return_type = agg_func.return_type.DeepCopy();
         auto bound_aggr = duckdb::make_uniq<duckdb::BoundAggregateExpression>(
             std::move(agg_func),
             std::move(arg_exprs),
@@ -2286,8 +2302,9 @@ PgPhysicalPlanGenerator::CreatePlanAgg(Agg *agg) {
             nullptr,
             aggr_type
         );
-        bound_aggr->return_type = return_type;
 
+        bound_aggr->return_type = return_type;
+        output_types[temp_resno++] = return_type.DeepCopy();
         aggregates.push_back(std::move(bound_aggr));
     }
 
@@ -2374,7 +2391,7 @@ PgPhysicalPlanGenerator::CreatePlanAgg(Agg *agg) {
                 duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> fun_args;
                 fun_args.push_back(
                     duckdb::make_uniq<duckdb::BoundReferenceExpression>(
-                        "#" + std::to_string(col),                   // alias
+                       "#" + std::to_string(col),                   // alias
                         child_types[col],
                         col
                     )
@@ -3119,7 +3136,7 @@ static vector<string> getOutputColumnNames(PlannedStmt *pstmt) {
 extern "C" bool
 pg_run_duckdb_physical_plan(void *stmt_ptr, void **out_plan_ptr, char **error_msg) {
     // 1. 建一个“长期存活”的 DuckDB 实例和连接（避免 plan 指向已销毁 allocator）
-    static duckdb::DuckDB db("/home/shf/duckdb/postgresql-16.1/contrib/duckdb-1.4.2/build/release/t.db");
+    static duckdb::DuckDB db("/home/yzx/duckdb/postgresql-16.1/contrib/duckdb-1.4.2/build/release/t.db");
     static duckdb::Connection conn(db);
 
     try {
@@ -3138,6 +3155,7 @@ pg_run_duckdb_physical_plan(void *stmt_ptr, void **out_plan_ptr, char **error_ms
         PgPhysicalPlanGenerator gen(ctx);
         unique_ptr<duckdb::PhysicalPlan> plan = gen.PlanFromPlannedStmt(pstmt);
 
+        plan->Root().Print();
         // 3. 生成可执行prepared plan
         shared_ptr<PreparedStatementData> prepared = make_shared_ptr<PreparedStatementData>(StatementType::SELECT_STATEMENT);
         auto prep = make_shared_ptr<StatementProperties>();
@@ -3169,8 +3187,7 @@ pg_run_duckdb_physical_plan(void *stmt_ptr, void **out_plan_ptr, char **error_ms
                 unique_ptr<QueryResult> res = ctx.ExecutePendingQueryInternal(*lock, *pending);
                 if (res)
                 {
-                    set_error(error_msg, res->ToString().c_str());
-                    elog(WARNING, "%s", res->ToString().c_str());
+                    elog(WARNING, "\n %s", res->ToString().c_str());
                 }
             }
         }

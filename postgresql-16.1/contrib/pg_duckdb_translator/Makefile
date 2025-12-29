@@ -17,7 +17,7 @@ LDFLAGS ?= $(DUCKDB_LIB) -lstdc++ -lpthread
 
 
 
-SOURCES_CC = pg_duckdb_translator.cc pg_duckdb_mapper.cc
+SOURCES_CC = pg_duckdb_translator.cc pg_duckdb_mapper.cc scan/postgres_scan.cc scan/postgres_table_reader.cc pg/relations.cc pg/memory.cc pg/transactions.cc  pg/types.cc pgduckdb_types.cc pgduckdb_metadata_cache.cc pgduckdb_duckdb.cc pgduckdb_detoast.cc pgduckdb_utils.cc pgduckdb_userdata_cache.cc
 SOURCES_C = pg_duckdb_sqlfuncs.c
 # No runtime tests or proto sources included by default; keep test artifacts
 # out of the extension build. Development tests should live under a

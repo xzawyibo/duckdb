@@ -21,7 +21,6 @@
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/planner/bound_statement.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
-
 #include <ctime>
 
 extern "C" {
