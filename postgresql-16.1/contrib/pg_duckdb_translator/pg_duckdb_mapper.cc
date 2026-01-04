@@ -49,6 +49,8 @@ extern PlannedStmt *g_current_pstmt;  // 在 translator 里定义并赋值
 extern std::vector<std::string> g_current_colnames;
 extern std::vector<duckdb::LogicalType> g_current_types;
 extern std::vector<int> g_current_attnum_map;
+extern std::vector<int> g_current_base_attno_map;
+
 
 // Implementation of map_pg_expr — accepts void* which is cast to Postgres Node*
 unique_ptr<Expression> map_pg_expr(void *vnode) {
@@ -102,60 +104,74 @@ unique_ptr<Expression> map_pg_expr(void *vnode) {
     };
 
     switch (nodeTag(node)) {
-        case T_Var: {
+       case T_Var: {
             Var *v = (Var *) node;
-        
-            // 先算一个列 index（用于 ColumnBinding 和 g_current_*）
+            
             int colidx = -1;
             int varatt = v->varattno;
-        
-            // 1) 优先走你原来的 attnum 映射（scan 阶段用的）
-            if (varatt > 0 && (size_t)(varatt - 1) < g_current_attnum_map.size()) {
-                int mapped = g_current_attnum_map[varatt - 1];
-                if (mapped >= 0) {
-                    colidx = mapped;
+            
+            // 判断是否 base relation Var（varno 落在 rtable 且 rte=RELATION）
+            bool is_base = false;
+            if (g_current_pstmt && v->varlevelsup == 0 &&
+                v->varno > 0 && v->varno <= list_length(g_current_pstmt->rtable)) {
+                RangeTblEntry *rte = rt_fetch(v->varno, g_current_pstmt->rtable);
+                if (rte && rte->rtekind == RTE_RELATION) {
+                    is_base = true;
                 }
             }
         
-            // 2) 如果映射表没给出任何东西，再退回用 varattno-1 兜底
-            //    （适用于 Agg/Sort 这种 “Var 指 child 输出列” 的情况）
-            if (colidx < 0 && varatt > 0) {
-                colidx = varatt - 1;
+            if (is_base) {
+                // ★ 关键：base table Var 必须用 attno->output_colidx 映射
+                if (varatt > 0 &&
+                    (size_t)varatt < g_current_base_attno_map.size() &&
+                    g_current_base_attno_map[varatt] >= 0) {
+                    colidx = g_current_base_attno_map[varatt];
+                } else {
+                    // 裁剪列后这里不能再 fallback varattno-1，否则必然出现 8/size6 这种炸点
+                    ereport(ERROR,
+                            (errmsg("map_pg_expr: base Var attno=%d has no mapping in g_current_base_attno_map (size=%zu)",
+                                    varatt, g_current_base_attno_map.size())));
+                }
+            } else {
+                // 非 base（例如 OUTER_VAR），按“child 输出 resno”语义处理
+                if (varatt > 0 && (size_t)(varatt - 1) < g_current_attnum_map.size()) {
+                    int mapped = g_current_attnum_map[varatt - 1];
+                    if (mapped >= 0) {
+                        colidx = mapped;
+                    }
+                }
+                if (colidx < 0 && varatt > 0) {
+                    colidx = varatt - 1; // 对 OUTER_VAR 等是正确语义
+                }
+                if (colidx < 0) {
+                    colidx = 0;
+                }
             }
         
-            // 最后的保险：如果还没确定，就保守给 0
-            if (colidx < 0) {
-                colidx = 0;
-            }
-        
+            // alias：你原来的逻辑可以保留（base 表名优先，否则用 g_current_colnames）
             std::string alias;
         
-            // 3) 第一步：如果 varno 是 base 表，就用 rtable 去查真正列名，就是这个car是base table的var比如order by那种
-            if (g_current_pstmt && v->varlevelsup == 0 &&
-                v->varno > 0 && v->varno <= list_length(g_current_pstmt->rtable)) {
-                
+            if (is_base) {
+                // 你原来的 base-table 查列名逻辑（保持不变）
+                Relation rel = nullptr;
                 RangeTblEntry *rte = rt_fetch(v->varno, g_current_pstmt->rtable);
                 if (rte && rte->rtekind == RTE_RELATION) {
-                    Relation rel = table_open(rte->relid, AccessShareLock);
+                    rel = table_open(rte->relid, AccessShareLock);
                     TupleDesc tupdesc = RelationGetDescr(rel);
-                
                     if (v->varattno > 0 && v->varattno <= tupdesc->natts) {
                         Form_pg_attribute attr = TupleDescAttr(tupdesc, v->varattno - 1);
                         if (!attr->attisdropped) {
                             const char *attname = NameStr(attr->attname);
                             if (attname && attname[0] != '\0') {
-                                alias = std::string(attname);  // 比如 "l_extendedprice"
+                                alias = std::string(attname);
                             }
                         }
                     }
-                
                     table_close(rel, AccessShareLock);
                 }
             }
-
-            // 4) 如果 base-table 查不到名字，再用当前输出 schema 的列名兜底
-            if (alias.empty()) 
-            {
+        
+            if (alias.empty()) {
                 if ((size_t)colidx < g_current_colnames.size()) {
                     alias = g_current_colnames[colidx];
                 } else {
@@ -163,11 +179,11 @@ unique_ptr<Expression> map_pg_expr(void *vnode) {
                 }
             }
         
-            // 5) 选类型：沿用你之前的逻辑
             duckdb::LogicalType ltype = duckdb::LogicalType::VARCHAR;
             if ((size_t)colidx < g_current_types.size()) {
                 ltype = g_current_types[colidx];
-            }       
+            }
+        
             return make_uniq<BoundReferenceExpression>(alias, ltype, colidx);
         }
 
