@@ -1310,7 +1310,7 @@ static Expr *StripRelabel(Expr *e) {
     return e;
 }
 
-// 2) flatten AND into a list of clauses
+// 2) flatten AND into a list of clauses后期可以在这里处理更多类型的条件
 static void CollectAndQuals(Expr *qual, std::vector<Expr*> &out) {
     qual = StripRelabel(qual);
     if (!qual) return;
@@ -1327,7 +1327,7 @@ static void CollectAndQuals(Expr *qual, std::vector<Expr*> &out) {
     out.push_back(qual);
 }
 
-// 3) PG Const -> DuckDB Value (covers TPCH-style types; you can extend later)
+// 3) PG Const -> DuckDB Value (covers TPCH-style types; 后面可以扩展)
 static duckdb::Value PgConstToDuckValue(Const *cst) {
     using namespace duckdb;
 
@@ -1335,7 +1335,7 @@ static duckdb::Value PgConstToDuckValue(Const *cst) {
         return Value(); // NULL
     }
 
-    switch (cst->consttype) {
+    switch (cst->consttype) {//consttype 是 PG 的类型 Oid
     case BOOLOID:
         return Value::BOOLEAN(DatumGetBool(cst->constvalue));
 
@@ -1354,7 +1354,7 @@ static duckdb::Value PgConstToDuckValue(Const *cst) {
     case TEXTOID:
     case VARCHAROID:
     case BPCHAROID: {
-        char *s = TextDatumGetCString(cst->constvalue);
+        char *s = TextDatumGetCString(cst->constvalue);//把 text/varchar/bpchar 的 Datum 变成 C 字符串
         std::string str = s ? std::string(s) : std::string();
         if (s) pfree(s);
 
@@ -1364,7 +1364,7 @@ static duckdb::Value PgConstToDuckValue(Const *cst) {
 
     case DATEOID: {
         // PG DateADT: days since 2000-01-01
-        DateADT pg_days = DatumGetDateADT(cst->constvalue);
+        DateADT pg_days = DatumGetDateADT(cst->constvalue);//DateADT 表示“距 2000-01-01 的天数”
 
         // DuckDB date_t: days since 1970-01-01
         int32_t duck_days = (int32_t)pg_days + 10957; // 1970->2000
@@ -1388,7 +1388,7 @@ static duckdb::Value PgConstToDuckValue(Const *cst) {
     }
 }
 
-// PG Var -> phys index (0-based) in returned_types/names
+// PG Var -> phys index (0-based) in returned_types/names 通过attano获取到物理列号对应到0-base
 static duckdb::idx_t PgVarToPgPhysical(Var *v, TupleDesc tupdesc, std::string &colname) {
     if (!v) {
         ereport(ERROR, (errmsg("PgVarToPgPhysical: null Var")));
@@ -1426,19 +1426,6 @@ static duckdb::ExpressionType ReverseCmp(duckdb::ExpressionType t) {
     }
 }
 
-// -----------------------------
-// 1) Collect Var attnos from a PG expression tree (base table Vars only)
-// -----------------------------
-// ---- CollectVarAttnos helper (PG Index disambiguation) ----
-// -------------------- helpers: ordered var collection --------------------
-struct CollectVarOrderedState {
-    ::Index scanrelid;                 // PG rtable index
-    int natts;                         // Relation natts
-    std::vector<bool> *seen;           // seen[attno]
-    std::vector<int> *out;             // ordered attnos
-};
-
-
 // ---------- pushdown parsed info ----------
 struct ParsedQualFilter {
     duckdb::idx_t physical;           // table physical column id (0..N-1)
@@ -1446,7 +1433,7 @@ struct ParsedQualFilter {
     duckdb::Value constant;           // const value
 };
 
-// Parse: Var OP Const  or  Const OP Var
+// Parse: Var OP Const  or  Const OP Var目前处理的就是只有var op const
 static bool TryParseComparisonQualToPhysicalFilter(
     Expr *qual,
     TupleDesc tupdesc,
@@ -1496,12 +1483,12 @@ static bool TryParseComparisonQualToPhysicalFilter(
     if (const_on_left) {
         cmp = ReverseCmp(cmp);
     }
-    if (!cst || cst->constisnull) {
+    if (!cst || cst->constisnull) {//目前也不处理null的这种条件
         return false;
     }
 
     std::string pg_colname;
-    auto phys = (duckdb::idx_t)PgVarToPgPhysical(var, tupdesc, pg_colname);
+    auto phys = (duckdb::idx_t)PgVarToPgPhysical(var, tupdesc, pg_colname);//从pg的var获取columnid
     auto v = PgConstToDuckValue(cst);
 
     out.physical = phys;
@@ -1518,7 +1505,7 @@ static inline duckdb::idx_t GetPhys(const duckdb::ColumnIndex &ci) {
 // Build column_ids as: [filter columns first] + [output columns], unique but keep order
 static void PushUniquePhysical(duckdb::vector<duckdb::ColumnIndex> &column_ids, duckdb::idx_t phys) {
     for (auto &ci : column_ids) {
-        if (GetPhys(ci) == phys) {
+        if (GetPhys(ci) == phys) {//去重：如果 column_ids 已经包含这个 physical id，就不再插入
             return;
         }
     }
@@ -1526,7 +1513,7 @@ static void PushUniquePhysical(duckdb::vector<duckdb::ColumnIndex> &column_ids, 
 }
 
 
-// Build phys->local mapping (local == index in column_ids)
+// Build phys->local mapping (local == index in column_ids)物理列号和local列号的对应
 static std::unordered_map<duckdb::idx_t, duckdb::idx_t>
 BuildPhysToLocalMap(const duckdb::vector<duckdb::ColumnIndex> &column_ids) {
     std::unordered_map<duckdb::idx_t, duckdb::idx_t> map;
@@ -1538,39 +1525,33 @@ BuildPhysToLocalMap(const duckdb::vector<duckdb::ColumnIndex> &column_ids) {
     return map;
 }
 
-static duckdb::vector<std::string> BuildPgPhysicalNameVector(TupleDesc tupdesc) {
-    duckdb::vector<std::string> names;
+//从pg的tupdesc 直接构造物理列号对应的returned_types/names
+static void BuildPgPhysicalSchemaKeepAttno(
+    TupleDesc tupdesc,
+    duckdb::vector<std::string> &names,
+    duckdb::vector<duckdb::LogicalType> &types
+) {
+    using namespace duckdb;
     int natts = tupdesc->natts;
+
+    names.clear();
+    types.clear();
     names.reserve(natts);
-
-    for (int i = 0; i < natts; i++) {
-        Form_pg_attribute att = TupleDescAttr(tupdesc, i);
-        if (att->attisdropped) {
-            // 占位：不会被引用即可
-            names.push_back("__dropped__" + std::to_string(i + 1));
-            continue;
-        }
-        names.push_back(std::string(NameStr(att->attname)));
-    }
-    return names;
-}
-
-static duckdb::vector<duckdb::LogicalType> BuildPgPhysicalTypeVector(TupleDesc tupdesc) {
-    duckdb::vector<duckdb::LogicalType> types;
-    int natts = tupdesc->natts;
     types.reserve(natts);
 
     for (int i = 0; i < natts; i++) {
-        Form_pg_attribute att = TupleDescAttr(tupdesc, i);
-        if (att->attisdropped) {
-            // 占位：不会被引用即可
-            types.push_back(duckdb::LogicalType::SQLNULL);
+        auto attr = TupleDescAttr(tupdesc, i); // i is 0-based, attno = i+1
+        if (attr->attisdropped) {
+            // 保持占位，确保 attno-1 映射不变
+            names.push_back("__dropped__" + std::to_string(i + 1));
+            types.push_back(LogicalType::SQLNULL);
             continue;
         }
-        types.push_back(PgTypeOidToDuckType(att->atttypid, att->atttypmod));
+        names.push_back(NameStr(attr->attname));
+        types.push_back(PgTypeOidToDuckType(attr->atttypid, attr->atttypmod));
     }
-    return types;
 }
+
 
 // -------------------- FIXED CreatePlanSeqScan --------------------
 duckdb::PhysicalOperator &
@@ -1591,11 +1572,13 @@ PgPhysicalPlanGenerator::CreatePlanSeqScan(SeqScan *scan) {
     TupleDesc tupdesc = RelationGetDescr(rel);
 
     // ---------- IMPORTANT: names/returned_types stay FULL physical schema ----------
-    duckdb::vector<std::string> physical_names = BuildPgPhysicalNameVector(tupdesc);   // size=16
-    duckdb::vector<duckdb::LogicalType> physical_types = BuildPgPhysicalTypeVector(tupdesc); // size=16
-
-    duckdb::vector<duckdb::LogicalType> returned_types = physical_types; // full
-    duckdb::vector<std::string> names = physical_names;                  // full
+    duckdb::vector<std::string> physical_names;
+    duckdb::vector<duckdb::LogicalType> physical_types;
+    
+    BuildPgPhysicalSchemaKeepAttno(tupdesc, physical_names, physical_types);
+    
+    duckdb::vector<duckdb::LogicalType> returned_types = physical_types; // FULL
+    duckdb::vector<std::string> names = physical_names;                        // full
 
     // ---------- 1) Collect output physical ids (in output order) ----------
     std::vector<duckdb::idx_t> output_phys;
@@ -1656,7 +1639,7 @@ PgPhysicalPlanGenerator::CreatePlanSeqScan(SeqScan *scan) {
         parsed_filters.push_back(std::move(pf));
     }
 
-    // ---------- 3) Build column_ids = [output cols] + [filter-only cols] ----------
+    // ---------- 3) Build column_ids = [output cols] + [filter-only cols] ----------构造 column_ids
     duckdb::vector<duckdb::ColumnIndex> column_ids;
     column_ids.reserve(output_phys.size() + parsed_filters.size());
 
@@ -1693,7 +1676,7 @@ PgPhysicalPlanGenerator::CreatePlanSeqScan(SeqScan *scan) {
         output_types.push_back(physical_types[phys]);
     }
 
-    // ---------- 6) Build table_filters with LOCAL keys ----------
+    // ---------- 6) Build table_filters with LOCAL keys ----------利用local key来将条件绑定到对应的列上
     unique_ptr<TableFilterSet> table_filters;
     if (!parsed_filters.empty()) {
     auto filters = make_uniq<TableFilterSet>();
@@ -1728,42 +1711,6 @@ PgPhysicalPlanGenerator::CreatePlanSeqScan(SeqScan *scan) {
     duckdb::vector<Value> parameters;
     duckdb::virtual_column_map_t virtual_columns;
 
-    // ---------- 8) Defensive asserts (optional but recommended) ----------
-    {
-        for (auto &ci : column_ids) {
-            auto phys = GetPhys(ci);
-            if (phys >= returned_types.size()) {
-                ereport(ERROR, (errmsg("BUG: column_ids phys=%llu but returned_types.size=%llu",
-                                       (unsigned long long)phys,
-                                       (unsigned long long)returned_types.size())));
-            }
-            if (phys >= names.size()) {
-                ereport(ERROR, (errmsg("BUG: column_ids phys=%llu but names.size=%llu",
-                                       (unsigned long long)phys,
-                                       (unsigned long long)names.size())));
-            }
-        }
-
-        for (auto pid : projection_ids) {
-            if (pid >= column_ids.size()) {
-                ereport(ERROR, (errmsg("BUG: projection_id=%llu but column_ids.size=%llu",
-                                       (unsigned long long)pid,
-                                       (unsigned long long)column_ids.size())));
-            }
-        }
-
-        if (table_filters) {
-            // DuckDB 1.4.2: TableFilterSet::filters 的 key 通常是 idx_t（scan-local）
-            for (auto &kv : table_filters->filters) {
-                auto key_local = (duckdb::idx_t)kv.first;
-                if (key_local >= column_ids.size()) {
-                    ereport(ERROR, (errmsg("BUG: filter key(local)=%llu but column_ids.size=%llu",
-                                           (unsigned long long)key_local,
-                                           (unsigned long long)column_ids.size())));
-                }
-            }
-        }
-    }
 
     // ---------- 9) Construct PhysicalTableScan ----------
     auto &scan_op = Make<PhysicalTableScan>(
