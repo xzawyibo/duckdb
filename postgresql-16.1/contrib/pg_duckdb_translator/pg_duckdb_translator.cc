@@ -3505,64 +3505,6 @@ static unique_ptr<Expression> map_pg_expr1(void *vnode, duckdb::ClientContext &c
             }
             return make_uniq<BoundConstantExpression>(duckdb::Value());
         }
-        case T_Aggref: {
-            Aggref *a = (Aggref *) node;
-            char *fname = NULL;
-            if (OidIsValid(a->aggfnoid)) fname = get_func_name(a->aggfnoid);
-            std::string aggname = fname ? std::string(fname) : std::string("agg");
-            std::string aggname_l = aggname;
-            for (auto &c : aggname_l) c = tolower(c);
-            if (a->aggstar && (aggname_l == "count" || aggname_l == "count_star")) aggname = std::string("count_star");
-            vector<unique_ptr<Expression>> children;
-            if (a->args != NIL) {
-                ListCell *alc;
-                foreach(alc, a->args) {
-                    Node *argnode = (Node *) lfirst(alc);
-                    unique_ptr<Expression> carg = nullptr;
-                    if (argnode && IsA(argnode, TargetEntry)) {
-                        TargetEntry *te = (TargetEntry *) argnode;
-                        if (te->expr) carg = map_pg_expr1((Node *) te->expr, context);
-                    } else {
-                        carg = map_pg_expr1(argnode, context);
-                    }
-                    if (!carg) carg = make_uniq<BoundConstantExpression>(duckdb::Value());
-                    children.push_back(std::move(carg));
-                }
-            }
-            if (a->aggdirectargs != NIL) {
-                ListCell *dlc;
-                foreach(dlc, a->aggdirectargs) {
-                    Node *dnode = (Node *) lfirst(dlc);
-                    unique_ptr<Expression> dc = map_pg_expr1(dnode, context);
-                    if (!dc) dc = make_uniq<BoundConstantExpression>(duckdb::Value());
-                    children.push_back(std::move(dc));
-                }
-            }
-            vector<LogicalType> arg_types;
-            for (auto &ch : children) arg_types.push_back(ch ? ch->return_type : LogicalType::ANY);
-            LogicalType ret_type = LogicalType::VARCHAR;
-            if (!aggname.empty()) {
-                std::string an = aggname;
-                for (auto &c : an) c = tolower(c);
-                if (an == "count" || an == "count_star" || an == "count(*)") ret_type = LogicalType::BIGINT;
-                else if (an == "sum") ret_type = LogicalType::DOUBLE;
-                else if (an == "avg") ret_type = LogicalType::DOUBLE;
-                else if (an == "min" || an == "max") { if (!arg_types.empty()) ret_type = arg_types[0]; else ret_type = LogicalType::VARCHAR; }
-                else ret_type = LogicalType::VARCHAR;
-            }
-            try {
-                AggregateFunction agg_fun(aggname, arg_types, ret_type,
-                    /*state_size*/ nullptr, /*initialize*/ nullptr, /*update*/ nullptr, /*combine*/ nullptr, /*finalize*/ nullptr,
-                    /*null_handling*/ FunctionNullHandling::DEFAULT_NULL_HANDLING, /*simple_update*/ nullptr, /*bind*/ nullptr, /*destructor*/ nullptr,
-                    /*statistics*/ nullptr, /*window*/ nullptr, /*serialize*/ nullptr, /*deserialize*/ nullptr);
-                unique_ptr<FunctionData> bind_info = nullptr;
-                return make_uniq<BoundAggregateExpression>(std::move(agg_fun), std::move(children), nullptr, std::move(bind_info), AggregateType::NON_DISTINCT);
-            } catch (...) {
-                ScalarFunction sf(std::vector<LogicalType>{}, LogicalType::DOUBLE, ScalarFunction::NopFunction);
-                sf.name = aggname;
-                return make_uniq<BoundFunctionExpression>(LogicalType::DOUBLE, std::move(sf), std::move(children), nullptr, false);
-            }
-        }
         default:
             return make_uniq<BoundConstantExpression>(duckdb::Value());
     }
