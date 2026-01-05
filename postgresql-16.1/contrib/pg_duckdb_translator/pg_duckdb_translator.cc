@@ -1297,10 +1297,6 @@ static void EnsureDuckdbQ1TestData() {
 }
 
 
-static void ClientNotice(const std::string &s) {
-    ereport(NOTICE, (errmsg_internal("%s", s.c_str())));
-}
-
 
 // 1) strip PG implicit cast wrapper
 static Expr *StripRelabel(Expr *e) {
@@ -1613,8 +1609,6 @@ PgPhysicalPlanGenerator::CreatePlanSeqScan(SeqScan *scan) {
     }
 
     // ---------- 2) Parse quals -> list of ParsedQualFilter (physical) ----------
-    ClientNotice("---- PG SeqScan qual ----");
-    ClientNotice("plan_node->qual length = " + std::to_string(list_length(plan_node->qual)));
 
     std::vector<Expr*> clauses;
     if (plan_node->qual) {
@@ -1622,7 +1616,6 @@ PgPhysicalPlanGenerator::CreatePlanSeqScan(SeqScan *scan) {
             CollectAndQuals((Expr *)lfirst(lc), clauses);
         }
     }
-    ClientNotice("flattened clauses = " + std::to_string((int)clauses.size()));
 
     std::vector<ParsedQualFilter> parsed_filters;
     parsed_filters.reserve(clauses.size());
@@ -1727,9 +1720,7 @@ PgPhysicalPlanGenerator::CreatePlanSeqScan(SeqScan *scan) {
         std::move(parameters),
         std::move(virtual_columns)
     );
-
-    // 不要 table_close(rel) —— 由 bind_data 析构处理
-    ClientNotice("---- DuckDB scan_op.ToString() right after construction ----\n" + scan_op.ToString());
+    table_close(rel, AccessShareLock);
     return scan_op;
 }
 
@@ -2880,8 +2871,6 @@ PgPhysicalPlanGenerator::CreatePlanSort(Sort *sort) {
         order.estimated_cardinality
     );
     top_proj.children.push_back(order);
-
-    top_proj.Print();
 
     return top_proj;
 
