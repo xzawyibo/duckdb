@@ -151,6 +151,8 @@
 #include "duckdb/common/types/decimal.hpp"
 #include "duckdb/function/function_binder.hpp"
 #include "duckdb/common/error_data.hpp"
+#include "duckdb/common/exception.hpp"
+#include "duckdb/common/string_util.hpp"
 
 extern "C" {
 #include "postgres.h"
@@ -185,6 +187,43 @@ using duckdb::unique_ptr;
 using duckdb::make_uniq;
 using duckdb::PhysicalOperator;
 using duckdb::ExpressionIterator;
+
+
+
+namespace {
+// 统一格式化
+template <typename... Args>
+static inline std::string Fmt(const char *fmt, Args &&...args) {
+    return duckdb::StringUtil::Format(fmt, std::forward<Args>(args)...);
+}
+
+// 未实现 / 不支持
+template <typename... Args>
+[[noreturn]] static inline void ThrowNotSupported(const char *fmt, Args &&...args) {
+    throw duckdb::NotImplementedException(Fmt(fmt, std::forward<Args>(args)...));
+}
+
+// 输入非法 / 不符合你们约束（更偏“用户/计划输入不合法”）
+template <typename... Args>
+[[noreturn]] static inline void ThrowInvalid(const char *fmt, Args &&...args) {
+    throw duckdb::InvalidInputException(Fmt(fmt, std::forward<Args>(args)...));
+}
+
+// 内部错误 / 按设计不该发生（更偏“你们的 bug”）
+template <typename... Args>
+[[noreturn]] static inline void ThrowInternal(const char *fmt, Args &&...args) {
+    throw duckdb::InternalException(Fmt(fmt, std::forward<Args>(args)...));
+}
+
+struct PfreeDeleter {
+    void operator()(char *p) const noexcept {
+        if (p) {
+            pfree(p);
+        }
+    }
+};
+
+} // anonymous namespace
 
 static duckdb::unique_ptr<duckdb::Expression> map_pg_expr1(void *vnode, duckdb::ClientContext &context);
 
@@ -1107,25 +1146,12 @@ PgPhysicalPlanGenerator::CreatePlan(Plan *plan) {
     // 当成 SeqScan 用：只用 iscan->scan 里的 scanrelid/plan/targetlist/qual
     return CreatePlanSeqScan((SeqScan *)&iscan->scan);
     }   
-    // default:
-    //     ereport(ERROR,
-    //             (errmsg("CreatePlan: unsupported nodeTag %d", nodeTag(plan))));
-
-    default: {
-            /* ★ 关键改动：把整个 Plan 节点转成字符串，直接塞到 ERROR 的 DETAIL 里 ★ */
-            char *plan_str = nodeToString((Node *)plan);
-
-            ereport(ERROR,
-                    (errmsg("CreatePlan: unsupported plan nodeTag=%d",
-                            (int)nodeTag(plan)),
-                     errdetail_internal("%s",
-                            plan_str ? plan_str : "<null>")));
-
-            /* 理论上 ereport 不会返回，这里的 pfree 不会执行；
-               只是演示一下，调试阶段这点内存泄露可以忽略。 */
-            if (plan_str) {
-                pfree(plan_str);
-            }
+        default: 
+        {
+            std::unique_ptr<char, PfreeDeleter> plan_str(nodeToString((Node *)plan));
+            const char *detail = plan_str ? plan_str.get() : "<null>";
+            ThrowNotSupported("CreatePlan: unsupported plan nodeTag=%d, detail=%s",
+                  (int)nodeTag(plan), detail);
         }
     }
 }
@@ -1387,21 +1413,22 @@ static duckdb::Value PgConstToDuckValue(Const *cst) {
 // PG Var -> phys index (0-based) in returned_types/names 通过attano获取到物理列号对应到0-base
 static duckdb::idx_t PgVarToPgPhysical(Var *v, TupleDesc tupdesc, std::string &colname) {
     if (!v) {
-        ereport(ERROR, (errmsg("PgVarToPgPhysical: null Var")));
+        ThrowInternal("PgVarToPgPhysical: null Var");
     }
     // varattno <= 0 是系统列(ctid等) 或者特殊引用，这里先不支持
     if (v->varattno <= 0) {
-        ereport(ERROR, (errmsg("PgVarToPgPhysical: system column Varattno=%d not supported", (int)v->varattno)));
+        ThrowNotSupported("PgVarToPgPhysical: system column Varattno=%d not supported",
+                          (int)v->varattno);
     }
 
     int attno = (int)v->varattno; // 1-based
     if (attno < 1 || attno > tupdesc->natts) {
-        ereport(ERROR, (errmsg("PgVarToPgPhysical: attno=%d out of range natts=%d", attno, (int)tupdesc->natts)));
+        ThrowInvalid("PgVarToPgPhysical: attno=%d out of range natts=%d", attno, tupdesc->natts);
     }
 
     Form_pg_attribute attr = TupleDescAttr(tupdesc, attno - 1);
     if (attr->attisdropped) {
-        ereport(ERROR, (errmsg("PgVarToPgPhysical: attno=%d refers to dropped column", attno)));
+        ThrowNotSupported("PgVarToPgPhysical: attno=%d refers to dropped column", attno);
     }
 
     colname = NameStr(attr->attname);
@@ -1561,7 +1588,7 @@ PgPhysicalPlanGenerator::CreatePlanSeqScan(SeqScan *scan) {
 
     RangeTblEntry *rte = rt_fetch(scan_node->scanrelid, pstmt->rtable);
     if (!rte || rte->rtekind != RTE_RELATION) {
-        ereport(ERROR, (errmsg("CreatePlanSeqScan: only base relation supported")));
+        ThrowNotSupported("CreatePlanSeqScan: only base relation supported");
     }
 
     struct RelationData *rel = table_open(rte->relid, AccessShareLock);
@@ -1592,10 +1619,11 @@ PgPhysicalPlanGenerator::CreatePlanSeqScan(SeqScan *scan) {
         std::string pg_colname;
         auto phys = (duckdb::idx_t)PgVarToPgPhysical(var, tupdesc, pg_colname);
 
-        if (phys >= physical_names.size()) {
-            ereport(ERROR, (errmsg("BUG: output physical id %llu out of range physical_names.size=%llu",
-                                   (unsigned long long)phys,
-                                   (unsigned long long)physical_names.size())));
+        if (phys >= physical_names.size()) 
+        {
+            ThrowInternal("BUG: output physical id %llu out of range physical_names.size=%llu",
+                      (unsigned long long)phys,
+                      (unsigned long long)physical_names.size());
         }
         output_phys.push_back(phys);
     }
@@ -1624,10 +1652,10 @@ PgPhysicalPlanGenerator::CreatePlanSeqScan(SeqScan *scan) {
         ParsedQualFilter pf;
         if (!TryParseComparisonQualToPhysicalFilter(cl, tupdesc, pf)) {
             // 你当前实现没有“未下推 qual 的 PhysicalFilter”，所以不能 silently ignore
-            ereport(ERROR,
-                    (errmsg("CreatePlanSeqScan: unsupported WHERE qual for pushdown (nodeTag=%d). "
-                            "Implement remaining qual as DuckDB PhysicalFilter or extend pushdown.",
-                            (int)nodeTag(StripRelabel(cl)))));
+            ThrowNotSupported(
+            "CreatePlanSeqScan: unsupported WHERE qual for pushdown (nodeTag=%d). "
+            "Implement remaining qual as DuckDB PhysicalFilter or extend pushdown.",
+            (int)nodeTag(StripRelabel(cl)));
         }
         parsed_filters.push_back(std::move(pf));
     }
@@ -1662,34 +1690,35 @@ PgPhysicalPlanGenerator::CreatePlanSeqScan(SeqScan *scan) {
     output_types.reserve(output_phys.size());
     for (auto phys : output_phys) {
         if (phys >= physical_types.size()) {
-            ereport(ERROR, (errmsg("BUG: output phys %llu out of range physical_types.size=%llu",
-                                   (unsigned long long)phys,
-                                   (unsigned long long)physical_types.size())));
+            ThrowInternal("BUG: output phys %llu out of range physical_types.size=%llu",
+                      (unsigned long long)phys,
+                      (unsigned long long)physical_types.size());
         }
         output_types.push_back(physical_types[phys]);
     }
 
     // ---------- 6) Build table_filters with LOCAL keys ----------利用local key来将条件绑定到对应的列上
     unique_ptr<TableFilterSet> table_filters;
-    if (!parsed_filters.empty()) {
-    auto filters = make_uniq<TableFilterSet>();
+    if (!parsed_filters.empty()) 
+    {
+        auto filters = make_uniq<TableFilterSet>();
 
-    for (auto &pf : parsed_filters) {
-        auto it = phys_to_local.find(pf.physical);
-        if (it == phys_to_local.end()) {
-            ereport(ERROR, (errmsg("BUG: filter phys %llu not found in column_ids",
-                                   (unsigned long long)pf.physical)));
+        for (auto &pf : parsed_filters) {
+            auto it = phys_to_local.find(pf.physical);
+            if (it == phys_to_local.end()) {
+                ThrowInternal("BUG: filter phys %llu not found in column_ids",
+                          (unsigned long long)pf.physical);
+            }
+            auto local = it->second;
+
+            auto tf = duckdb::make_uniq<ConstantFilter>(pf.cmp, pf.constant);
+            filters->PushFilter(duckdb::ColumnIndex(local), std::move(tf));
         }
-        auto local = it->second;
 
-        auto tf = duckdb::make_uniq<ConstantFilter>(pf.cmp, pf.constant);
-        filters->PushFilter(duckdb::ColumnIndex(local), std::move(tf));
+        if (!filters->filters.empty()) {
+            table_filters = std::move(filters);
+        }
     }
-
-    if (!filters->filters.empty()) {
-        table_filters = std::move(filters);
-    }
-}
 
     // ---------- 7) Build bind_data / table_func ----------
     // IMPORTANT: 如果 PostgresScanFunctionData 持有 rel 指针并在析构里 close，
@@ -1977,7 +2006,7 @@ PgPhysicalPlanGenerator::CreatePlanAgg(Agg *agg) {
     Plan *plan_node  = &agg->plan;
     Plan *child_plan = outerPlan(plan_node);
     if (!child_plan) {
-        ereport(ERROR, (errmsg("CreatePlanAgg: Agg without child")));
+        ThrowInternal("CreatePlanAgg: Agg without child");
     }
 
     // 1) 递归生成 child 的物理计划（通常是 SeqScan / Join / Sort 等）
@@ -2092,18 +2121,17 @@ PgPhysicalPlanGenerator::CreatePlanAgg(Agg *agg) {
 
             // 从 child targetlist 找到对应的 TargetEntry
             TargetEntry *tle = get_tle_by_resno(child_plan->targetlist, attno);
-            if (!tle) {
-                ereport(ERROR,
-                        (errmsg("CreatePlanAgg: cannot find group key resno %d in child targetlist",
-                                (int)attno)));
+            if (!tle) 
+            {
+                ThrowInternal("CreatePlanAgg: cannot find group key resno %d in child targetlist",
+                  (int)attno);
             }
 
             Expr *group_expr = (Expr *) tle->expr;
 
             auto duck_expr = map_pg_expr1((Node *)group_expr, this->context);
             if (!duck_expr) {
-                ereport(ERROR,
-                        (errmsg("CreatePlanAgg: map_pg_expr1 returned null for group key")));
+                ThrowInternal("CreatePlanAgg: map_pg_expr1 returned null for group key");
             }
 
             // 用 PG 类型覆盖 group key 的返回类型（后面压缩时会改）
@@ -2140,9 +2168,8 @@ PgPhysicalPlanGenerator::CreatePlanAgg(Agg *agg) {
         // 聚合函数名
         const char *fn_name_c = get_func_name(aggref->aggfnoid);
         if (!fn_name_c) {
-            ereport(ERROR,
-                    (errmsg("CreatePlanAgg: get_func_name failed for aggfnoid %u",
-                            aggref->aggfnoid)));
+            ThrowInternal("CreatePlanAgg: get_func_name failed for aggfnoid %u",
+                  (unsigned)aggref->aggfnoid);
         }
         std::string fn_name = fn_name_c;
 
@@ -2157,8 +2184,7 @@ PgPhysicalPlanGenerator::CreatePlanAgg(Agg *agg) {
 
         if (!is_count_star) {
             if (aggref->args == NIL) {
-                ereport(ERROR,
-                        (errmsg("CreatePlanAgg: aggregate %s has no args", fn_name_c)));
+                ThrowInternal("CreatePlanAgg: aggregate %s has no args", fn_name_c);
             }
 
             // 只取第一个参数
@@ -2167,8 +2193,7 @@ PgPhysicalPlanGenerator::CreatePlanAgg(Agg *agg) {
 
             auto duck_arg = map_pg_expr1((Node *)arg_expr, this->context);
             if (!duck_arg) {
-                ereport(ERROR,
-                        (errmsg("CreatePlanAgg: map_pg_expr1 returned null for agg arg")));
+                ThrowInternal("CreatePlanAgg: map_pg_expr1 returned null for agg arg");
             }
 
             Oid   arg_typid  = exprType((Node *)arg_expr);
@@ -2216,9 +2241,8 @@ PgPhysicalPlanGenerator::CreatePlanAgg(Agg *agg) {
             agg_func.bind(context, agg_func, arg_exprs);
 
         if (!agg_func.combine) {
-            ereport(ERROR,
-                    (errmsg("CreatePlanAgg: cannot find aggregate function implementation for %s",
-                            fn_name_c)));
+            ThrowInternal("CreatePlanAgg: cannot find aggregate function implementation for %s",
+                            fn_name_c);
         }
 
         return_type = agg_func.return_type.DeepCopy();
@@ -2514,8 +2538,7 @@ PgPhysicalPlanGenerator::CreatePlanSort(Sort *sort) {
     Plan *plan_node = &sort->plan;
     Plan *child_plan = outerPlan(plan_node);
     if (!child_plan) {
-        ereport(ERROR,
-                (errmsg("CreatePlanSort: Sort without child")));
+        ThrowInternal("CreatePlanSort: Sort without child");
     }
 
     // 1. 递归构造 child 的物理计划
@@ -2583,9 +2606,8 @@ PgPhysicalPlanGenerator::CreatePlanSort(Sort *sort) {
             }
         }
         if (!tle) {
-            ereport(ERROR,
-                    (errmsg("CreatePlanSort: cannot find TargetEntry for sortColIdx %d",
-                            (int)resno)));
+            ThrowInternal("CreatePlanSort: cannot find TargetEntry for sortColIdx %d",
+                            (int)resno);
         }
 
         // 类型：判断是不是字符串
@@ -2604,8 +2626,8 @@ PgPhysicalPlanGenerator::CreatePlanSort(Sort *sort) {
         bool reverse = false;
         Oid eq_op = get_equality_op_for_ordering_op(sortop, &reverse);
         if (!OidIsValid(eq_op)) {
-            ereport(ERROR,
-                    (errmsg("CreatePlanSort: invalid ordering operator %u", sortop)));
+            ThrowNotSupported("CreatePlanSort: invalid/unsupported ordering operator %u",
+                  (unsigned)sortop);
         }
         OrderType order_type = reverse ? OrderType::DESCENDING
                                        : OrderType::ASCENDING;
@@ -2742,10 +2764,10 @@ PgPhysicalPlanGenerator::CreatePlanSort(Sort *sort) {
     for (int i = 0; i < sort->numCols; i++) {
         idx_t col_idx = sort_col_indices[i];
         if (col_idx >= order_child_types.size()) {
-            ereport(ERROR,
-                    (errmsg("CreatePlanSort: sortColIdx %zu out of range (child has %zu cols)",
-                            (size_t)col_idx,
-                            (size_t)order_child_types.size())));
+            ThrowInternal("CreatePlanSort: sortColIdx %zu out of range (child has %zu cols)",
+              (size_t)col_idx,
+              (size_t)order_child_types.size());
+
         }
 
         // ★ 关键：这里 alias 设成 key_names[i]，所以 ToString 会打印列名，而不是 #[0.0] ★
@@ -3215,9 +3237,9 @@ static unique_ptr<Expression> map_pg_expr1(void *vnode, duckdb::ClientContext &c
                     colidx = g_current_base_attno_map[varatt];
                 } else {
                     // 裁剪列后这里不能再 fallback varattno-1，否则必然出现 8/size6 这种炸点
-                    ereport(ERROR,
-                            (errmsg("map_pg_expr: base Var attno=%d has no mapping in g_current_base_attno_map (size=%zu)",
-                                    varatt, g_current_base_attno_map.size())));
+                    ThrowInternal("map_pg_expr: base Var attno=%d has no mapping in g_current_base_attno_map (size=%zu)",
+                                    varatt,g_current_base_attno_map.size());
+
                 }
             } else {
                 // 非 base（例如 OUTER_VAR），按“child 输出 resno”语义处理
