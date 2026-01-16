@@ -3303,7 +3303,7 @@ PgPhysicalPlanGenerator::CreatePlanHashJoin(HashJoin *hj)
     auto op = duckdb::make_uniq<duckdb::LogicalComparisonJoin>(join_type);
     // op->types = out_types;  // 设置输出列类型
     // op->join_type = duckdb::JoinType::INNER;  // 默认为 INNER JOIN（可以根据 op.join_type 设置）
-    // op->estimated_cardinality = (idx_t)Max(hj->join.plan.plan_rows, 0.0);  // 使用 PG 计划的行数估算
+    op->estimated_cardinality = (idx_t)plan_node->plan_rows;  // 使用 PG 计划的行数估算
     // op->left_projection_map.clear();  // 先不处理 projection，输出全列
     // op->right_projection_map.clear();
     // op->mark_types.clear();  // 先不处理 MARK join
@@ -3311,14 +3311,18 @@ PgPhysicalPlanGenerator::CreatePlanHashJoin(HashJoin *hj)
 
     // 确定join类型
     op->join_type = join_type;
+    // 确定输出类型
+    op->types.insert(op->types.end(), out_types.begin(), out_types.end());
+    // op->left_projection_map.push_back(0);
+    // op->right_projection_map.push_back(0);
     // 构造左右map
     for (int i = 0; i < list_length(((Plan *)plan_node->lefttree)->targetlist); i++)
         op->left_projection_map.push_back(i);
     for (int i = 0; i < list_length(((Plan *)plan_node->righttree)->targetlist); i++)
         op->right_projection_map.push_back(i);
 
-    // auto &join = Make<PhysicalHashJoin>(
-    return Make<PhysicalHashJoin>(
+    //auto &join = Make<PhysicalHashJoin>(
+     return Make<PhysicalHashJoin>(
         *op,                    // LogicalComparisonJoin 实例
         left,                   // 左子树的物理计划
         right,                  // 右子树的物理计划
@@ -3330,10 +3334,10 @@ PgPhysicalPlanGenerator::CreatePlanHashJoin(HashJoin *hj)
         op->estimated_cardinality, // 估算的输出行数
         nullptr // 推下的过滤条件
     );
-    /*
+/*
     // 2.6 接孩子（你的分支里 children 是可 push PhysicalOperator& 的写法）
-    join.children.push_back(left);
-    join.children.push_back(right);
+    // join.children.push_back(left);
+    // join.children.push_back(right);
 
     PhysicalOperator *cur = &join;
 
