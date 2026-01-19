@@ -3169,14 +3169,21 @@ pg_run_duckdb_physical_plan(void *stmt_ptr, void **out_plan_ptr, char **error_ms
     }
 }
 
+static inline duckdb::vector<duckdb::idx_t> IdentityProjectionMap(duckdb::idx_t n) {
+    duckdb::vector<duckdb::idx_t> m;
+    m.reserve(n);
+    for (duckdb::idx_t i = 0; i < n; i++) {
+        m.push_back(i);
+    }
+    return m;
+}
+
 static inline duckdb::JoinType PgJoinTypeToDuck(int pg_jointype) {
-    // PG JoinType enum: JOIN_INNER=0, JOIN_LEFT=1, JOIN_FULL=2, JOIN_RIGHT=3, ...
     switch (pg_jointype) {
     case 0:  return duckdb::JoinType::INNER;
     case 1:  return duckdb::JoinType::LEFT;
     case 2:  return duckdb::JoinType::OUTER;
     case 3:  return duckdb::JoinType::RIGHT;
-    // 你后续要支持 SEMI/ANTI 再补
     default: return duckdb::JoinType::INNER;
     }
 }
@@ -3192,7 +3199,7 @@ static inline duckdb::ExpressionType PgOpNameToDuckCmp(const char *opname) {
     return ExpressionType::INVALID;
 }
 
-
+// 只解析 HashJoin 的 hashclauses：必须是 OUTER_VAR/INNER_VAR 两个 Var 的 '='
 static bool TryParseHashClauseToJoinCondition(
     Expr *clause,
     const duckdb::vector<duckdb::LogicalType> &left_types,
@@ -3214,7 +3221,6 @@ static bool TryParseHashClauseToJoinCondition(
     auto *v1 = (Var *)a1;
     auto *v2 = (Var *)a2;
 
-    // 识别 OUTER/INNER
     Var *outer = nullptr;
     Var *inner = nullptr;
     if (v1->varno == OUTER_VAR && v2->varno == INNER_VAR) {
@@ -3222,29 +3228,23 @@ static bool TryParseHashClauseToJoinCondition(
     } else if (v1->varno == INNER_VAR && v2->varno == OUTER_VAR) {
         outer = v2; inner = v1;
     } else {
-        // 也可能 planner 生成了别的 varno（更复杂的情况以后再扩展）
         return false;
     }
 
-    // comparison
     const char *opname = get_opname(opexpr->opno);
     auto cmp = PgOpNameToDuckCmp(opname);
-    if (cmp != ExpressionType::COMPARE_EQUAL) {
-        // Q3 hashjoin 理论上就是 '='；先把范围 join 拒绝掉
-        return false;
-    }
+    if (cmp != ExpressionType::COMPARE_EQUAL) return false;
 
-    idx_t lidx = (idx_t)outer->varattno - 1; // varattno 1-based
+    idx_t lidx = (idx_t)outer->varattno - 1; // 注意：OUTER/INNER 的 varattno 是“子节点输出列序号”
     idx_t ridx = (idx_t)inner->varattno - 1;
 
-    if (lidx >= left_types.size() || ridx >= right_types.size())
-        return false;
+    if (lidx >= left_types.size() || ridx >= right_types.size()) return false;
 
-    // JoinCondition 的 left/right 表达式通常是“各自 child 的局部列引用”
+    // 关键：这里的 type 必须来自 child.types，否则就会出现 DATE/INTEGER 引用错类型
     auto lexpr = make_uniq<BoundReferenceExpression>(left_types[lidx], lidx);
     auto rexpr = make_uniq<BoundReferenceExpression>(right_types[ridx], ridx);
 
-    // 如果类型不一致，先把一侧 cast 到另一侧（最保守：cast RHS 到 LHS）
+    // 如果你后面遇到 key 类型不一致（例如 bpchar vs varchar），这里可以加 cast
     // if (left_types[lidx] != right_types[ridx]) {
     //     rexpr = BoundCastExpression::AddCastToType(std::move(rexpr), left_types[lidx]);
     // }
@@ -3255,105 +3255,86 @@ static bool TryParseHashClauseToJoinCondition(
     return true;
 }
 
-
-duckdb::PhysicalOperator &PgPhysicalPlanGenerator::CreatePlanHash(::Hash *h)
-{
+duckdb::PhysicalOperator &PgPhysicalPlanGenerator::CreatePlanHash(::Hash *h) {
     return CreatePlan(h->plan.lefttree);
 }
 
-duckdb::PhysicalOperator &
-PgPhysicalPlanGenerator::CreatePlanHashJoin(HashJoin *hj) 
-{
+duckdb::PhysicalOperator &PgPhysicalPlanGenerator::CreatePlanHashJoin(HashJoin *hj) {
     using namespace duckdb;
 
     auto *plan_node = (Plan *)hj;
 
-    // 2.1 递归生成左右子树
+    // 1) children
     PhysicalOperator &left  = CreatePlan(plan_node->lefttree);
     PhysicalOperator &right = CreatePlan(plan_node->righttree);
 
-    // 2.2 抽 join conditions（来自 hj->hashclauses）
+    // 2) join conditions
     vector<JoinCondition> conditions;
     conditions.reserve(list_length(hj->hashclauses));
-
     for (ListCell *lc = list_head(hj->hashclauses); lc; lc = lnext(hj->hashclauses, lc)) {
         auto *cl = (Expr *)lfirst(lc);
         JoinCondition cond;
         if (!TryParseHashClauseToJoinCondition(cl, left.types, right.types, cond)) {
-            ThrowNotSupported("HashJoin: unsupported hashclause (nodeTag=%d)", (int)nodeTag(StripRelabel(cl)));
+            ThrowNotSupported("HashJoin: unsupported hashclause (nodeTag=%d)",
+                              (int)nodeTag(StripRelabel(cl)));
         }
         conditions.push_back(std::move(cond));
     }
 
-    // 2.3 join 输出类型：默认 left 全列 + right 全列
-    vector<LogicalType> join_types;
-    join_types.reserve(left.types.size() + right.types.size());
-    for (auto &t : left.types) 
-        join_types.push_back(t);
-    for (auto &t : right.types) 
-        join_types.push_back(t);
-
-    // 2.4 join type
+    // 3) join type & card
     auto join_type = PgJoinTypeToDuck(hj->join.jointype);
-
     idx_t estimated_card = (idx_t)plan_node->plan_rows;
 
-    vector<duckdb::LogicalType> out_types = left.types;  // 初始化输出类型为左侧子树的列类型
-    out_types.insert(out_types.end(), right.types.begin(), right.types.end());  // 添加右侧子树的列类型
-    auto op = duckdb::make_uniq<duckdb::LogicalComparisonJoin>(join_type);
-    // op->types = out_types;  // 设置输出列类型
-    // op->join_type = duckdb::JoinType::INNER;  // 默认为 INNER JOIN（可以根据 op.join_type 设置）
-    op->estimated_cardinality = (idx_t)plan_node->plan_rows;  // 使用 PG 计划的行数估算
-    // op->left_projection_map.clear();  // 先不处理 projection，输出全列
-    // op->right_projection_map.clear();
-    // op->mark_types.clear();  // 先不处理 MARK join
-    // op->filter_pushdown = nullptr;  // 先不处理 filter pushdown
+    // 4) 先强制 join 输出 = left 全列 + right 全列（保证正确）
+    auto left_proj  = IdentityProjectionMap(left.types.size());
+    auto right_proj = IdentityProjectionMap(right.types.size());
 
-    // 确定join类型
-    op->join_type = join_type;
-    // 确定输出类型
-    op->types.insert(op->types.end(), out_types.begin(), out_types.end());
-    // op->left_projection_map.push_back(0);
-    // op->right_projection_map.push_back(0);
-    // 构造左右map
-    for (int i = 0; i < list_length(((Plan *)plan_node->lefttree)->targetlist); i++)
-        op->left_projection_map.push_back(i);
-    for (int i = 0; i < list_length(((Plan *)plan_node->righttree)->targetlist); i++)
-        op->right_projection_map.push_back(i);
+    vector<LogicalType> join_types;
+    join_types.reserve(left.types.size() + right.types.size());
+    for (auto &t : left.types) join_types.push_back(t);
+    for (auto &t : right.types) join_types.push_back(t);
 
-    //auto &join = Make<PhysicalHashJoin>(
-     return Make<PhysicalHashJoin>(
-        *op,                    // LogicalComparisonJoin 实例
-        left,                   // 左子树的物理计划
-        right,                  // 右子树的物理计划
-        std::move(conditions),  // 连接条件
-        join_type,              // 连接类型（如 INNER JOIN、LEFT JOIN 等）
-        op->left_projection_map,    // 左子树的投影映射
-        op->right_projection_map,   // 右子树的投影映射
-        std::move(op->mark_types), // 标记类型（可选）
-        op->estimated_cardinality, // 估算的输出行数
-        nullptr // 推下的过滤条件
+    // 5) dummy logical join（必须用正确构造）
+    LogicalComparisonJoin dummy(join_type, LogicalOperatorType::LOGICAL_COMPARISON_JOIN);
+    dummy.types = join_types;
+    dummy.estimated_cardinality = estimated_card;
+
+    // 6) physical hash join
+    vector<LogicalType> mark_types; // 非 MARK join 为空
+    auto &join = Make<PhysicalHashJoin>(
+        dummy,
+        left,
+        right,
+        std::move(conditions),
+        join_type,
+        left_proj,      // 关键：基于 left.types.size()
+        right_proj,     // 关键：基于 right.types.size()
+        std::move(mark_types),
+        estimated_card,
+        nullptr
     );
-/*
-    // 2.6 接孩子（你的分支里 children 是可 push PhysicalOperator& 的写法）
+
+    // 强制校准（防止 join.types 被 projection map/构造逻辑弄空）
+    join.types = join_types;
+    join.estimated_cardinality = estimated_card;
+
+    // 你的工程里 children 是“push 引用”的模式就保留；如果 Make 已经接了孩子，这里删掉也可以
     // join.children.push_back(left);
     // join.children.push_back(right);
 
     PhysicalOperator *cur = &join;
 
-    // 2.7 在 join 上方加投影：匹配 PG join.plan.targetlist 的列顺序（含 resjunk）
-    // join 输出的列下标规则：left[0..L-1] + right[0..R-1]
+    // 7) 对齐 PG join.plan.targetlist 的输出列顺序（只处理 Var）
+    //    join 当前输出列规则：left[0..L-1] + right[0..R-1]
     {
         vector<LogicalType> proj_types;
         vector<unique_ptr<Expression>> proj_exprs;
 
-        // 提前算 left 宽度
         idx_t left_width = left.types.size();
 
-        for (ListCell *lc = list_head(plan_node->targetlist); lc; lc = lnext(plan_node->targetlist, lc))
-        {
+        for (ListCell *lc = list_head(plan_node->targetlist); lc; lc = lnext(plan_node->targetlist, lc)) {
             TargetEntry *tle = (TargetEntry *)lfirst(lc);
-            if (!tle) continue;
+            if (!tle || tle->resjunk) continue;
 
             Expr *e = StripRelabel(tle->expr);
             if (!IsA(e, Var)) {
@@ -3361,7 +3342,7 @@ PgPhysicalPlanGenerator::CreatePlanHashJoin(HashJoin *hj)
             }
             Var *v = (Var *)e;
 
-            idx_t out_idx = 0;
+            idx_t out_idx;
             if (v->varno == OUTER_VAR) {
                 out_idx = (idx_t)v->varattno - 1;
             } else if (v->varno == INNER_VAR) {
@@ -3383,7 +3364,7 @@ PgPhysicalPlanGenerator::CreatePlanHashJoin(HashJoin *hj)
             proj_exprs.push_back(std::move(ref));
         }
 
-        auto &proj_op = Make<duckdb::PhysicalProjection>(
+        auto &proj_op = Make<PhysicalProjection>(
             std::move(proj_types),
             std::move(proj_exprs),
             estimated_card
@@ -3392,10 +3373,8 @@ PgPhysicalPlanGenerator::CreatePlanHashJoin(HashJoin *hj)
         cur = &proj_op;
     }
 
-    return *cur;*/
+    return *cur;
 }
-
-
 
 
 // Implementation of map_pg_expr — accepts void* which is cast to Postgres Node*
